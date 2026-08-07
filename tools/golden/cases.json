@@ -24,6 +24,18 @@
       "script": "simulation_start.py",
       "args": ["--dataset", "df_pc_real_prob.pkl", "--start", "1", "--end", "400",
                "--is_best", "--constraint_factor_veh", "3", "--constraint_factor_ff", "3"]
+    },
+    {
+      "comment": "FQF agent, train mode from a fresh seeded init (no checkpoint exists for the current agent API). Weights are only saved every 10000 interventions, so a short run writes none. device=cpu in the fixture: GPU kernels are not bit-reproducible. capture_metrics because the script accepts --save_metrics_as but never writes it.",
+      "name": "agent_fqf_train",
+      "script": "agent_run_explainable.py",
+      "capture_metrics": true,
+      "args": ["--hyper_params", "{FIXTURES}/hyper_params_fqf.json",
+               "--agent_model", "fqf", "--model_name", "golden_agent.pt",
+               "--dataset", "df_pc_prob_rare_skills_merged.pkl",
+               "--reward_weights", "rw_rupture_ff.json",
+               "--start", "1", "--end", "400", "--n_hours", "2", "--top_n", "5",
+               "--constraint_factor_veh", "1", "--constraint_factor_ff", "3", "--train"]
     }
   ]
 }

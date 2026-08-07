@@ -60,15 +60,29 @@ tree. `make_workspace.py` therefore builds `Data_environment/` as a real
 directory of per-file symlinks (not a symlink to the folder), which keeps `..`
 inside the workspace.
 
-## Caveat on coverage
+## Coverage
 
-The cases only cover `simulation_start.py` (the heuristic baseline). The agent
-path (`agent_run_explainable.py`) is **not** pinned yet: it needs a trained
-checkpoint plus `--hyper_params`/`--reward_weights` files, and in `--train` mode
-it mutates weights, so it is not a pure function of its inputs. Add an eval-only
-case (`--load`, no `--train`) before refactoring that script.
+Four cases cover `simulation_start.py` (the heuristic baseline) and one covers
+`agent_run_explainable.py` (FQF). Both sides of the comparison the refactor is
+about to merge are therefore pinned.
 
-Note also that windows shorter than ~60 interventions crash in
-`reinforcement_returning` (a lookup runs past the end of the sliced `df_pc`), so
-`--end` must stay comfortably above that. That is a latent bug in the simulation,
-worth fixing on its own once the refactor is under way.
+The agent case runs in `--train` mode from a fresh seeded init rather than from a
+checkpoint: no checkpoint exists for the current agent API. Weights are only
+saved every 10000 interventions, so a 400-intervention run writes none — the run
+does not mutate anything on disk. `fixtures/hyper_params_fqf.json` sets
+`device: cpu`, since GPU kernels are not bit-reproducible across machines.
+
+## Known issues this harness had to work around
+
+`agent_run_explainable.py` accepts `--save_metrics_as` but **never writes it**,
+so there is no artifact to compare; `run_golden.py --capture-metrics` pickles
+`dic_indic` out of the script's globals instead. Giving that flag a real
+implementation belongs with the rewrite of the script, not here.
+
+Windows shorter than ~60 interventions crash in `reinforcement_returning` (a
+lookup runs past the end of the sliced `df_pc`), so `--end` must stay comfortably
+above that. That is a latent bug in the simulation, worth fixing on its own.
+
+The stale `Data/hyper_params.json` in the data tree cannot instantiate the
+current `FQFAgent`: it carries `AM`/`N`, renamed to `am`/`n_quantiles`. The
+fixture here is the corrected version.

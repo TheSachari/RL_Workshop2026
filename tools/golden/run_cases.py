@@ -37,19 +37,24 @@ def build_workspace(data_root: Path, workspace: Path) -> None:
 
 def run_case(case: dict, workspace: Path, tag: str) -> dict:
     """Execute one case; return its metrics dict."""
-    cmd = [
-        sys.executable, str(HERE / "run_golden.py"),
-        "--workspace", str(workspace),
-        case["script"], *case["args"],
-        "--save_metrics_as", tag,
-    ]
+    out = workspace / "Plots" / f"{tag}.pkl"
+    cmd = [sys.executable, str(HERE / "run_golden.py"), "--workspace", str(workspace)]
+
+    # Some scripts never write their metrics; capture them from module globals.
+    if case.get("capture_metrics"):
+        cmd += ["--capture-metrics", str(out)]
+
+    args = [a.replace("{FIXTURES}", str(HERE / "fixtures")) for a in case["args"]]
+    cmd += [case["script"], *args]
+    if not case.get("capture_metrics"):
+        cmd += ["--save_metrics_as", tag]
+
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
             f"case {case['name']} failed (exit {proc.returncode}):\n"
             f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
         )
-    out = workspace / "Plots" / f"{tag}.pkl"
     if not out.is_file():
         raise RuntimeError(f"case {case['name']} produced no metrics at {out}")
     with out.open("rb") as fh:
