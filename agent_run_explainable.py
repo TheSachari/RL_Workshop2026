@@ -38,6 +38,7 @@ from agent_explainable import *
 from collective_functions import *
 from explainability import *
 from paths import DATA, REWARD_WEIGHTS, SVG_MODEL, resolve
+from sim_state import Fleet
 
 from datetime import datetime, timedelta
 import torch
@@ -123,13 +124,9 @@ if __name__ == "__main__":
     vehicle_evo, reward_evo, current_ff_inter = [], [], []
     dic_log, dic_back, dic_start_time, dic_veh_typ = {}, {}, {}, {}
 
-    VSAV_to_station, VSAV_from_station = "", ""
-    FPT_to_station, FPT_from_station = "", ""
-    EPA_to_station, EPA_from_station = "", ""
-    VSAV_sent, VSAV_lent, VSAV_needed, VSAV_to_return, VSAV_returning = (False,) * 5
-    FPT_sent, FPT_lent, FPT_needed, FPT_to_return, FPT_returning = (False,) * 5
-    EPA_sent, EPA_lent, EPA_needed, EPA_to_return, EPA_returning = (False,) * 5
-    VSAV_disp, FPT_disp, EPA_disp = (0,)*3
+    # Reinforcement bookkeeping for VSAV/FPT/EPA. Field defaults match the
+    # flat initialisation this replaces ("" / False / 0).
+    fleet = Fleet()
 
     eps_update = (args.end-args.start) // 23 # approx. 23 iterations to reach 5% of original eps
     d = 1
@@ -161,26 +158,26 @@ if __name__ == "__main__":
             skills_updated = update_skills(df_skills, date_reference)
     
     
-        if (VSAV_sent) and (num_inter == VSAV_arrival_num) :  # ARRIVEE DES RENFORTS VSAV
-            dic_vehicles, VSAV_sent, VSAV_lent, VSAV_returning, \
+        if (fleet.VSAV.sent) and (num_inter == fleet.VSAV.arrival_num) :  # ARRIVEE DES RENFORTS VSAV
+            dic_vehicles, fleet.VSAV.sent, fleet.VSAV.lent, fleet.VSAV.returning, \
             dic_ff, planning, dic_back, dic_lent, dic_log, \
-            VSAV_to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, VSAV_from_station, VSAV_to_station, VSAV_sent, \
-                                                    VSAV_returning, VSAV_lent, VSAV_to_return, month, day, hour, dic_start_time, "VSAV")
+            fleet.VSAV.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
+                                                    dic_ff, dic_log, planning, fleet.VSAV.from_station, fleet.VSAV.to_station, fleet.VSAV.sent, \
+                                                    fleet.VSAV.returning, fleet.VSAV.lent, fleet.VSAV.to_return, month, day, hour, dic_start_time, "VSAV")
     
-        if (FPT_sent) and (num_inter == FPT_arrival_num) :  # ARRIVEE DES RENFORTS FPT
-            dic_vehicles, FPT_sent, FPT_lent, FPT_returning, \
+        if (fleet.FPT.sent) and (num_inter == fleet.FPT.arrival_num) :  # ARRIVEE DES RENFORTS FPT
+            dic_vehicles, fleet.FPT.sent, fleet.FPT.lent, fleet.FPT.returning, \
             dic_ff, planning, dic_back, dic_lent, dic_log, \
-            FPT_to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, FPT_from_station, FPT_to_station, FPT_sent, \
-                                                    FPT_returning, FPT_lent, FPT_to_return, month, day, hour, dic_start_time, "FPT")
+            fleet.FPT.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
+                                                    dic_ff, dic_log, planning, fleet.FPT.from_station, fleet.FPT.to_station, fleet.FPT.sent, \
+                                                    fleet.FPT.returning, fleet.FPT.lent, fleet.FPT.to_return, month, day, hour, dic_start_time, "FPT")
     
-        if (EPA_sent) and (num_inter == EPA_arrival_num) :  # ARRIVEE DES RENFORTS EPA
-            dic_vehicles, EPA_sent, EPA_lent, EPA_returning, \
+        if (fleet.EPA.sent) and (num_inter == fleet.EPA.arrival_num) :  # ARRIVEE DES RENFORTS EPA
+            dic_vehicles, fleet.EPA.sent, fleet.EPA.lent, fleet.EPA.returning, \
             dic_ff, planning, dic_back, dic_lent, dic_log, \
-            EPA_to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, EPA_from_station, EPA_to_station, EPA_sent, \
-                                                    EPA_returning, EPA_lent, EPA_to_return, month, day, hour, dic_start_time, "EPA")
+            fleet.EPA.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
+                                                    dic_ff, dic_log, planning, fleet.EPA.from_station, fleet.EPA.to_station, fleet.EPA.sent, \
+                                                    fleet.EPA.returning, fleet.EPA.lent, fleet.EPA.to_return, month, day, hour, dic_start_time, "EPA")
     
         if (required_departure == {0:"RETURN"}):  # RETOUR D'INTERVENTION    
             vehicle_out, dic_vehicles, dic_ff, current_ff_inter, planning, \
@@ -202,7 +199,7 @@ if __name__ == "__main__":
             new_required_departure = {}
             stations = iter(pdd)            
             inter_done = False
-            VSAV_to_return, FPT_to_return, EPA_to_return = (False,) * 3
+            fleet.VSAV.to_return, fleet.FPT.to_return, fleet.EPA.to_return = (False,) * 3
             station_lvl = 0
             idx_role = 0
             v_mat_to_return = 0
@@ -319,17 +316,17 @@ if __name__ == "__main__":
     
                                 if li_mat_veh: # Si des véhicules ont la fonction requise   
     
-                                    if VSAV_to_return and (current_station == VSAV_to_station) and (num_d == 99):
+                                    if fleet.VSAV.to_return and (current_station == fleet.VSAV.to_station) and (num_d == 99):
                                         v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
                                                                                    current_station, dic_vehicles, "VSAV", v_mat_to_return)
                                         # print("VSAV_to_return", v_mat, v_waiting)
                                         
-                                    elif FPT_to_return and (current_station == FPT_to_station) and (num_d == 100):
+                                    elif fleet.FPT.to_return and (current_station == fleet.FPT.to_station) and (num_d == 100):
                                         v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
                                                                                    current_station, dic_vehicles, "FPT", v_mat_to_return)
                                         # print("FPT_to_return", v_mat, v_waiting)
                                         
-                                    elif EPA_to_return and (current_station == EPA_to_station) and (num_d == 101):
+                                    elif fleet.EPA.to_return and (current_station == fleet.EPA.to_station) and (num_d == 101):
                                         v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
                                                                                    current_station, dic_vehicles, "EPA", v_mat_to_return) 
                                         # print("EPA_to_return", v_mat, v_waiting)
@@ -371,39 +368,39 @@ if __name__ == "__main__":
                                             planning[current_station][month][day][hour]['standby'] = []    
                                             dic_vehicles[current_station]["standby"].remove(v_mat)
     
-                                            if VSAV_needed and (num_d == 99): # DEPART VSAV EN RENFORT
+                                            if fleet.VSAV.needed and (num_d == 99): # DEPART VSAV EN RENFORT
                                                 dic_start_time[v_mat] = (month, day, hour)
-                                                VSAV_from_station, dic_vehicles, VSAV_arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, VSAV_needed, \
-                                                VSAV_sent  = reinforcement_sending(num_inter, current_station, VSAV_from_station, v_mat, \
+                                                fleet.VSAV.from_station, dic_vehicles, fleet.VSAV.arrival_num, dic_lent, \
+                                                dic_log, new_required_departure, fleet.VSAV.needed, \
+                                                fleet.VSAV.sent  = reinforcement_sending(num_inter, current_station, fleet.VSAV.from_station, v_mat, \
                                                                                    dic_vehicles, dic_station_distance, \
-                                                                                   VSAV_to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, VSAV_needed, \
-                                                                                   VSAV_sent, required_departure, \
+                                                                                   fleet.VSAV.to_station, date, df_pc, idx, \
+                                                                                   dic_lent, ff_to_send, dic_log, fleet.VSAV.needed, \
+                                                                                   fleet.VSAV.sent, required_departure, \
                                                                                    new_required_departure, num_d, "VSAV")
                                                 dic_indic['z1_VSAV_sent'] += 1
     
-                                            elif FPT_needed and (num_d == 100): # DEPART FPT EN RENFORT
+                                            elif fleet.FPT.needed and (num_d == 100): # DEPART FPT EN RENFORT
                                                 dic_start_time[v_mat] = (month, day, hour)
-                                                FPT_from_station, dic_vehicles, FPT_arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, FPT_needed, \
-                                                FPT_sent  = reinforcement_sending(num_inter, current_station, FPT_from_station, v_mat, \
+                                                fleet.FPT.from_station, dic_vehicles, fleet.FPT.arrival_num, dic_lent, \
+                                                dic_log, new_required_departure, fleet.FPT.needed, \
+                                                fleet.FPT.sent  = reinforcement_sending(num_inter, current_station, fleet.FPT.from_station, v_mat, \
                                                                                    dic_vehicles, dic_station_distance, \
-                                                                                   FPT_to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, FPT_needed, \
-                                                                                   FPT_sent, required_departure, \
+                                                                                   fleet.FPT.to_station, date, df_pc, idx, \
+                                                                                   dic_lent, ff_to_send, dic_log, fleet.FPT.needed, \
+                                                                                   fleet.FPT.sent, required_departure, \
                                                                                    new_required_departure, num_d, "FPT")
                                                 dic_indic['z1_FPT_sent'] += 1
     
-                                            elif EPA_needed and (num_d == 101): # DEPART EPA EN RENFORT
+                                            elif fleet.EPA.needed and (num_d == 101): # DEPART EPA EN RENFORT
                                                 dic_start_time[v_mat] = (month, day, hour)
-                                                EPA_from_station, dic_vehicles, EPA_arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, EPA_needed, \
-                                                EPA_sent  = reinforcement_sending(num_inter, current_station, EPA_from_station, v_mat, \
+                                                fleet.EPA.from_station, dic_vehicles, fleet.EPA.arrival_num, dic_lent, \
+                                                dic_log, new_required_departure, fleet.EPA.needed, \
+                                                fleet.EPA.sent  = reinforcement_sending(num_inter, current_station, fleet.EPA.from_station, v_mat, \
                                                                                    dic_vehicles, dic_station_distance, \
-                                                                                   EPA_to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, EPA_needed, \
-                                                                                   EPA_sent, required_departure, \
+                                                                                   fleet.EPA.to_station, date, df_pc, idx, \
+                                                                                   dic_lent, ff_to_send, dic_log, fleet.EPA.needed, \
+                                                                                   fleet.EPA.sent, required_departure, \
                                                                                    new_required_departure, num_d, "EPA")
                                                 dic_indic['z1_EPA_sent'] += 1
                                                 # print(num_inter, "EPA", EPA_sent)
@@ -414,35 +411,35 @@ if __name__ == "__main__":
     
                                                 if all_ff_waiting: # RETOUR DES RENFORTS
     
-                                                    if VSAV_to_return and (num_d == 99):  # RETOUR DU VSAV
-                                                        VSAV_from_station, VSAV_to_station, VSAV_arrival_num, dic_back, dic_log, \
-                                                        VSAV_needed, VSAV_sent, all_ff_waiting, v_waiting, VSAV_to_return, \
-                                                        VSAV_returning = reinforcement_returning(num_inter, VSAV_to_station, VSAV_from_station, \
+                                                    if fleet.VSAV.to_return and (num_d == 99):  # RETOUR DU VSAV
+                                                        fleet.VSAV.from_station, fleet.VSAV.to_station, fleet.VSAV.arrival_num, dic_back, dic_log, \
+                                                        fleet.VSAV.needed, fleet.VSAV.sent, all_ff_waiting, v_waiting, fleet.VSAV.to_return, \
+                                                        fleet.VSAV.returning = reinforcement_returning(num_inter, fleet.VSAV.to_station, fleet.VSAV.from_station, \
                                                                                                  dic_log, \
                                                                                                  v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, VSAV_needed, \
-                                                                                                 VSAV_sent, all_ff_waiting, v_waiting, \
-                                                                                                 VSAV_returning, "VSAV")
+                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.VSAV.needed, \
+                                                                                                 fleet.VSAV.sent, all_ff_waiting, v_waiting, \
+                                                                                                 fleet.VSAV.returning, "VSAV")
     
-                                                    elif FPT_to_return and (num_d == 100): # RETOUR DU FPT
-                                                        FPT_from_station, FPT_to_station, FPT_arrival_num, dic_back, dic_log, \
-                                                        FPT_needed, FPT_sent, all_ff_waiting, v_waiting, FPT_to_return, \
-                                                        FPT_returning = reinforcement_returning(num_inter, FPT_to_station, FPT_from_station, \
+                                                    elif fleet.FPT.to_return and (num_d == 100): # RETOUR DU FPT
+                                                        fleet.FPT.from_station, fleet.FPT.to_station, fleet.FPT.arrival_num, dic_back, dic_log, \
+                                                        fleet.FPT.needed, fleet.FPT.sent, all_ff_waiting, v_waiting, fleet.FPT.to_return, \
+                                                        fleet.FPT.returning = reinforcement_returning(num_inter, fleet.FPT.to_station, fleet.FPT.from_station, \
                                                                                                 dic_log, \
                                                                                                 v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, FPT_needed, \
-                                                                                                 FPT_sent, all_ff_waiting, v_waiting, \
-                                                                                                 FPT_returning, "FPT")
+                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.FPT.needed, \
+                                                                                                 fleet.FPT.sent, all_ff_waiting, v_waiting, \
+                                                                                                 fleet.FPT.returning, "FPT")
     
-                                                    elif EPA_to_return and (num_d == 101):  # RETOUR DE L'EPA
-                                                        EPA_from_station, EPA_to_station, EPA_arrival_num, dic_back, dic_log, \
-                                                        EPA_needed, EPA_sent, all_ff_waiting, v_waiting, EPA_to_return, \
-                                                        EPA_returning = reinforcement_returning(num_inter, EPA_to_station, EPA_from_station, \
+                                                    elif fleet.EPA.to_return and (num_d == 101):  # RETOUR DE L'EPA
+                                                        fleet.EPA.from_station, fleet.EPA.to_station, fleet.EPA.arrival_num, dic_back, dic_log, \
+                                                        fleet.EPA.needed, fleet.EPA.sent, all_ff_waiting, v_waiting, fleet.EPA.to_return, \
+                                                        fleet.EPA.returning = reinforcement_returning(num_inter, fleet.EPA.to_station, fleet.EPA.from_station, \
                                                                                                 dic_log, \
                                                                                                 v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, EPA_needed, \
-                                                                                                 EPA_sent, all_ff_waiting, v_waiting, \
-                                                                                                 EPA_returning, "EPA")
+                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.EPA.needed, \
+                                                                                                 fleet.EPA.sent, all_ff_waiting, v_waiting, \
+                                                                                                 fleet.EPA.returning, "EPA")
                                                   
                                                 else: # retour impossible, pompiers indisponibles
     
@@ -475,40 +472,40 @@ if __name__ == "__main__":
     
                                                 if (current_station in Z_1): # GESTION DES RENFORTS
     
-                                                    if not VSAV_sent: # s'il n'y a pas de renfort en route
-                                                        VSAV_disp, VSAV_to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "VSAV") 
+                                                    if not fleet.VSAV.sent: # s'il n'y a pas de renfort en route
+                                                        fleet.VSAV.disp, fleet.VSAV.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "VSAV") 
                                                         
-                                                        stations_VSAV, VSAV_needed, VSAV_to_return, new_required_departure, VSAV_to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(VSAV_disp, VSAV_needed, VSAV_to_return, VSAV_lent, VSAV_to_station, \
+                                                        stations_VSAV, fleet.VSAV.needed, fleet.VSAV.to_return, new_required_departure, fleet.VSAV.to_station, \
+                                                        dic_ff, v_mat_to_return = veh_management(fleet.VSAV.disp, fleet.VSAV.needed, fleet.VSAV.to_return, fleet.VSAV.lent, fleet.VSAV.to_station, \
                                                                                 new_required_departure, dic_station_distance, num_inter, dic_lent, \
                                                                                 dic_vehicles, dic_functions, dic_ff, 2, "VSAV", 99) 
                                                         
-                                                        dic_indic['VSAV_needed'] += int(VSAV_needed)
-                                                        dic_indic['VSAV_disp'] = int(VSAV_disp)
+                                                        dic_indic['VSAV_needed'] += int(fleet.VSAV.needed)
+                                                        dic_indic['VSAV_disp'] = int(fleet.VSAV.disp)
                                                         # print(num_inter, "v_mat", v_mat_to_return)
     
-                                                    elif not FPT_sent:
-                                                        FPT_disp, FPT_to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "FPT")
+                                                    elif not fleet.FPT.sent:
+                                                        fleet.FPT.disp, fleet.FPT.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "FPT")
                                                         
-                                                        stations_FPT, FPT_needed, FPT_to_return, new_required_departure, FPT_to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(FPT_disp, FPT_needed, FPT_to_return, FPT_lent, FPT_to_station, \
+                                                        stations_FPT, fleet.FPT.needed, fleet.FPT.to_return, new_required_departure, fleet.FPT.to_station, \
+                                                        dic_ff, v_mat_to_return = veh_management(fleet.FPT.disp, fleet.FPT.needed, fleet.FPT.to_return, fleet.FPT.lent, fleet.FPT.to_station, \
                                                                                 new_required_departure, dic_station_distance, num_inter, dic_lent, \
                                                                                 dic_vehicles, dic_functions, dic_ff, 2, "FPT", 100) 
     
-                                                        dic_indic['FPT_needed'] += int(FPT_needed)
-                                                        dic_indic['FPT_disp'] = int(FPT_disp)
+                                                        dic_indic['FPT_needed'] += int(fleet.FPT.needed)
+                                                        dic_indic['FPT_disp'] = int(fleet.FPT.disp)
                                                         # print(num_inter, "v_mat", v_mat_to_return)
     
-                                                    elif not EPA_sent:
-                                                        EPA_disp, EPA_to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "EPA")
+                                                    elif not fleet.EPA.sent:
+                                                        fleet.EPA.disp, fleet.EPA.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "EPA")
                                                         
-                                                        stations_EPA, EPA_needed, EPA_to_return, new_required_departure, EPA_to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(EPA_disp, EPA_needed, EPA_to_return, EPA_lent, EPA_to_station, \
+                                                        stations_EPA, fleet.EPA.needed, fleet.EPA.to_return, new_required_departure, fleet.EPA.to_station, \
+                                                        dic_ff, v_mat_to_return = veh_management(fleet.EPA.disp, fleet.EPA.needed, fleet.EPA.to_return, fleet.EPA.lent, fleet.EPA.to_station, \
                                                                                 new_required_departure, dic_station_distance, num_inter, dic_lent, \
                                                                                 dic_vehicles, dic_functions, dic_ff, 1, "EPA", 101)   
     
-                                                        dic_indic['EPA_needed'] += int(EPA_needed)
-                                                        dic_indic['EPA_disp'] = int(EPA_disp)
+                                                        dic_indic['EPA_needed'] += int(fleet.EPA.needed)
+                                                        dic_indic['EPA_disp'] = int(fleet.EPA.disp)
                                                         # print(num_inter, "v_mat", v_mat_to_return)
     
                                         
@@ -519,7 +516,7 @@ if __name__ == "__main__":
     
                                             ff_mats = planning[current_station][month][day][hour]["planned"].copy()
     
-                                            ff_existing = adding_lent_ff(VSAV_lent, FPT_lent, EPA_lent, \
+                                            ff_existing = adding_lent_ff(fleet.VSAV.lent, fleet.FPT.lent, fleet.EPA.lent, \
                                                                          current_station, Z_1, dic_lent, ff_mats, dic_ff)  
                                             
                                             if v_waiting:
@@ -528,23 +525,23 @@ if __name__ == "__main__":
     
                                                 v_mat = v_mat_to_return
     
-                                                if VSAV_to_return and (current_station==VSAV_to_station) and "VSAV" in dic_functions[v_mat]:    
+                                                if fleet.VSAV.to_return and (current_station==fleet.VSAV.to_station) and "VSAV" in dic_functions[v_mat]:    
                                                     all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
                                                                                                    dic_lent, dic_ff, v_mat)
                                                     # print("VSAV_to_return", VSAV_to_return, "all_ff_waiting", all_ff_waiting)
     
-                                                if not all_ff_waiting and FPT_to_return and (current_station==FPT_to_station) and \
+                                                if not all_ff_waiting and fleet.FPT.to_return and (current_station==fleet.FPT.to_station) and \
                                                 "FPT" in dic_functions[v_mat]:    
                                                     all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
                                                                                                    dic_lent, dic_ff, v_mat)
-                                                    VSAV_to_return = False
+                                                    fleet.VSAV.to_return = False
                                                     # print("FPT_to_return", FPT_to_return, "all_ff_waiting", all_ff_waiting)
                                                     
-                                                if not all_ff_waiting and EPA_to_return and (current_station==EPA_to_station) and \
+                                                if not all_ff_waiting and fleet.EPA.to_return and (current_station==fleet.EPA.to_station) and \
                                                 "EPA" in dic_functions[v_mat]:   
                                                     all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
                                                                                                    dic_lent, dic_ff, v_mat)
-                                                    FPT_to_return = False
+                                                    fleet.FPT.to_return = False
                                                     # print("EPA_to_return", EPA_to_return, "all_ff_waiting", all_ff_waiting)
     
                                                 if all_ff_waiting:
@@ -555,7 +552,7 @@ if __name__ == "__main__":
                                                 else: 
                                                     # print("not all ff waiting")
                                                     ff_existing = [f for f in ff_existing if dic_ff[f] > -1].copy()
-                                                    EPA_to_return = False
+                                                    fleet.EPA.to_return = False
                                                     
                                             else: # no vehicle waiting
                                                 lent_ff = [ff for v_m in dic_lent.values() for ff_lent in v_m.values() for ff in ff_lent]
@@ -607,7 +604,7 @@ if __name__ == "__main__":
     
                                             dic_indic, dic_lent, all_roles_found, vehicle_found, planning, dic_vehicles, dic_ff, idx_role, \
                                             degraded = step(action, idx_role, ff_existing, all_ff_waiting, current_station, Z_1, dic_lent, \
-                                                            v_mat, dic_ff, VSAV_lent, FPT_lent, EPA_lent, planning, month, day, hour, num_inter, \
+                                                            v_mat, dic_ff, fleet.VSAV.lent, fleet.FPT.lent, fleet.EPA.lent, planning, month, day, hour, num_inter, \
                                                             new_required_departure, num_d, list_v, num_role, mandatory, degraded, team_max, \
                                                             all_roles_found, vehicle_found, dic_vehicles, dic_indic, \
                                                             skill_lvl, station_lvl)
@@ -642,7 +639,7 @@ if __name__ == "__main__":
                 lr_C = lr_O = 0
 
             print(f"{num_inter} v_out: {vehicle_out} | rwd_mean: {rwd_mean:.2f} | v1notfroms1: {dic_indic['v1_not_sent_from_s1']} | v3notfroms3: {dic_indic['v3_not_sent_from_s3']} | v_not_found_ls: {dic_indic['v_not_found_in_last_station']} | deg: {dic_indic['v_degraded']} | rupture_ff: {dic_indic["rupture_ff"]}", flush=True)
-            print(f"{num_inter} z1_VSAV_sent: {dic_indic['z1_VSAV_sent']} | z1_FPT_sent: {dic_indic['z1_FPT_sent']} | z1_EPA_sent: {dic_indic['z1_EPA_sent']} | VSAV_disp: {VSAV_disp} | FPT_disp: {FPT_disp} | EPA_disp: {EPA_disp} |", flush=True)
+            print(f"{num_inter} z1_VSAV_sent: {dic_indic['z1_VSAV_sent']} | z1_FPT_sent: {dic_indic['z1_FPT_sent']} | z1_EPA_sent: {dic_indic['z1_EPA_sent']} | VSAV_disp: {fleet.VSAV.disp} | FPT_disp: {fleet.FPT.disp} | EPA_disp: {fleet.EPA.disp} |", flush=True)
 
             dic_delta = {key:(dic_indic[key] - dic_indic_100[key]) for key in dic_indic}
 
