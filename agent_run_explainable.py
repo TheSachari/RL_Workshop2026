@@ -575,8 +575,15 @@ if __name__ == "__main__":
                                                               coord_x, coord_y, month_sin, month_cos, day_sin, \
                                                               day_cos, hour_sin, hour_cos, info_avail, max_duration, action_size)
     
-                                            loss = 0
-                                                
+                                            # Learn from the previous transition. `compute` guards the
+                                            # first action, where there is no old_state/reward yet.
+                                            if compute and args.train:
+                                                l0 = agent.step(old_state, action, reward, state, inter_done)
+                                                if l0 is not None:
+                                                    loss = l0
+                                            else:
+                                                loss = 0
+
                                             action, skill_lvl, potential_actions = agent.act(state, all_ff_waiting, eps)
     
                                             
@@ -607,12 +614,16 @@ if __name__ == "__main__":
     
     
     
-                                            dic_indic_old = dic_indic.copy()                                            
-    
+                                            # REWARD (must be read before dic_indic_old is refreshed)
+                                            reward = compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif)
+                                            dic_indic_old = dic_indic.copy()
+
+                                            score += reward
                                             action_num += 1
-    
-                                            
+                                            reward_evo.append([action_num, reward])
+
                                             old_state = state
+                                            compute = True
     
     
                                 # else: # si aucun véhicule n'a la fonction requise

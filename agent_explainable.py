@@ -448,8 +448,10 @@ class DQNAgent:
         if self.q_updates % self.decay_update == 0:
             self._maybe_decay_lr()
 
-        # Update PER priorities
-        self.memory.update_priorities(idx, td_error.detach().abs().cpu().numpy())
+        # Update PER priorities. Flatten the trailing axis: the sum-tree stores
+        # one scalar per index, and a (batch, 1) array would hand it 1-element
+        # arrays instead.
+        self.memory.update_priorities(idx, td_error.detach().abs().flatten().cpu().numpy())
         return float(loss.detach().cpu().item())
 
     def _maybe_decay_lr(self) -> None:
@@ -1017,9 +1019,11 @@ class FQFAgent:
         if self.q_updates % self.decay_update == 0:
             self._maybe_decay_lr()
 
-        # PER priorities: reduce td_error across quantiles
-        td_error_scalar = td_error.sum(dim=1).mean(dim=1, keepdim=True)
-        self.memory.update_priorities(idx, td_error_scalar.detach().cpu().numpy())
+        # PER priorities: reduce td_error across quantiles to one value per
+        # sample. keepdim would leave a trailing axis, so each "priority" would
+        # be a 1-element array and the sum-tree assignment would fail.
+        td_error_scalar = td_error.sum(dim=1).mean(dim=1)
+        self.memory.update_priorities(idx, td_error_scalar.detach().abs().cpu().numpy())
 
         return float(loss.detach().cpu().item()), float(entropy.mean().detach().cpu().item())
 
