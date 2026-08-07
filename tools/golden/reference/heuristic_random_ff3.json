@@ -1,0 +1,40 @@
+{
+  "case": "heuristic_random_ff3",
+  "script": "simulation_start.py",
+  "args": [
+    "--dataset",
+    "df_pc_real_prob.pkl",
+    "--start",
+    "1",
+    "--end",
+    "400",
+    "--constraint_factor_veh",
+    "1",
+    "--constraint_factor_ff",
+    "3"
+  ],
+  "recorded_utc": "2026-08-07T13:35:45+00:00",
+  "metrics": {
+    "v_required": 535,
+    "v_sent": 545,
+    "v_sent_full": 453,
+    "v_degraded": 92,
+    "rupture_ff": 1299,
+    "function_not_found": 404,
+    "v1_not_sent_from_s1": 279,
+    "v3_not_sent_from_s3": 456,
+    "v_not_found_in_last_station": 82,
+    "ff_required": 0,
+    "ff_sent": 1635,
+    "z1_VSAV_sent": 0,
+    "z1_FPT_sent": 0,
+    "z1_EPA_sent": 0,
+    "VSAV_needed": 0,
+    "FPT_needed": 0,
+    "EPA_needed": 0,
+    "VSAV_disp": 3,
+    "FPT_disp": 0,
+    "EPA_disp": 0,
+    "skill_lvl": 2821.0
+  }
+}

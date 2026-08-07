@@ -1,0 +1,41 @@
+{
+  "case": "heuristic_best_veh3",
+  "script": "simulation_start.py",
+  "args": [
+    "--dataset",
+    "df_pc_real_prob.pkl",
+    "--start",
+    "1",
+    "--end",
+    "400",
+    "--is_best",
+    "--constraint_factor_veh",
+    "3",
+    "--constraint_factor_ff",
+    "3"
+  ],
+  "recorded_utc": "2026-08-07T13:36:48+00:00",
+  "metrics": {
+    "v_required": 535,
+    "v_sent": 498,
+    "v_sent_full": 404,
+    "v_degraded": 94,
+    "rupture_ff": 1820,
+    "function_not_found": 674,
+    "v1_not_sent_from_s1": 318,
+    "v3_not_sent_from_s3": 578,
+    "v_not_found_in_last_station": 136,
+    "ff_required": 0,
+    "ff_sent": 1483,
+    "z1_VSAV_sent": 20,
+    "z1_FPT_sent": 0,
+    "z1_EPA_sent": 0,
+    "VSAV_needed": 25,
+    "FPT_needed": 27,
+    "EPA_needed": 0,
+    "VSAV_disp": 2,
+    "FPT_disp": 2,
+    "EPA_disp": 0,
+    "skill_lvl": 2681.0
+  }
+}

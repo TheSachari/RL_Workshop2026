@@ -1,0 +1,29 @@
+{
+  "comment": "Short reference runs (~30s each). Each must stay bit-identical across every refactor step. NB: windows shorter than ~60 interventions crash in reinforcement_returning (lookup runs past the end of the sliced df_pc), so --end must stay comfortably above that.",
+  "cases": [
+    {
+      "name": "heuristic_best_ff3",
+      "script": "simulation_start.py",
+      "args": ["--dataset", "df_pc_real_prob.pkl", "--start", "1", "--end", "400",
+               "--is_best", "--constraint_factor_veh", "1", "--constraint_factor_ff", "3"]
+    },
+    {
+      "name": "heuristic_best_ff1",
+      "script": "simulation_start.py",
+      "args": ["--dataset", "df_pc_real_prob.pkl", "--start", "1", "--end", "400",
+               "--is_best", "--constraint_factor_veh", "1", "--constraint_factor_ff", "1"]
+    },
+    {
+      "name": "heuristic_random_ff3",
+      "script": "simulation_start.py",
+      "args": ["--dataset", "df_pc_real_prob.pkl", "--start", "1", "--end", "400",
+               "--constraint_factor_veh", "1", "--constraint_factor_ff", "3"]
+    },
+    {
+      "name": "heuristic_best_veh3",
+      "script": "simulation_start.py",
+      "args": ["--dataset", "df_pc_real_prob.pkl", "--start", "1", "--end", "400",
+               "--is_best", "--constraint_factor_veh", "3", "--constraint_factor_ff", "3"]
+    }
+  ]
+}
