@@ -1,0 +1,9 @@
+geopandas
+ipython
+numpy
+pandas
+schedulefree
+scikit-learn
+shapely
+torch
+tqdm

@@ -1,0 +1,56 @@
+# Preprocessing
+
+```python3 preprocess.py --inters inters.csv --sorties sorties.csv --pdd pdd.geojson --materiel materiel.csv```
+
+Running it for the first time will create the following folders :
+
+["Data_preprocessed", "Data_trained", "Data_sampled", "Data_environment", "SVG_model", "Plots", "Reward_weights"]
+
+Preprocesses the raw data from the ```./Data``` folder.
+
+# Train
+
+```train.py --lr 0.0025 --layers 1024 --num_timesteps 1000 --is_y_cond --save_as agent_name ```
+
+Trains the model. 
+
+# Sample
+
+```sample.py --load_as agent_name --save_sample_as df_fake_sample_p12.pkl --to_keep 40 --value_span 100 --pressure 1.2 ```
+
+Samples new interventions from a trained model. 
+
+# Generate environment
+
+```generate_environment.py --sample_list df_fake_sample_p12.pkl  --prob_dep --save_as df_pc_fake_10y_prob_p12.pkl ```
+
+# Explainability
+
+```explainability.py -- dataset df_fake_sample_p12.pkl --rarity 80 ```
+
+Precomputes rare skills for explainability.
+
+# Simulation
+
+
+```simulation_start.py --dataset df_pc_real_prob.pkl --start 1 --end 202 --is_best --constraint_factor_veh 1 --constraint_factor_ff 3 --save_metrics_as metrics_name```
+
+Runs the simulation.
+
+# Agent
+
+```agent_run_explainable.py --model_name agent_name --agent_model fqf --hyper_params hyper_params.json --reward_weights rw_rupture_ff.json --dataset df_pc_prob_rare_skills_merged.pkl --start 1 --end 63696 --n_hours 2 --top_n 5 --constraint_factor_veh 1 --constraint_factor_ff 1 --save_metrics_as metrics --train```
+
+Trains an agent with ```--train```. \
+Loads training weights in training mode with ```--load```. \
+Otherwise, runs the agent ```agent_name``` in test mode.
+
+
+
+
+
+
+
+
+
+
