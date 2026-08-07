@@ -329,14 +329,18 @@ class DQNAgent:
         state: Union[np.ndarray, Tensor],
         all_ff_waiting,
         eps: float = 0.0,
-    ) -> Tuple[int, int]:
-        """Epsilon-greedy action selection with masking of invalid actions."""
+    ) -> Tuple[int, int, List[int]]:
+        """Epsilon-greedy action selection with masking of invalid actions.
+
+        Returns the feasible actions alongside the choice: callers use them for
+        explainability (which alternatives were available and rejected).
+        """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
 
         if np.random.uniform() <= eps:
             action = random.choice(potential_actions)
             skill_lvl = potential_skills[potential_actions.index(action)]
-            return action, skill_lvl
+            return action, skill_lvl, potential_actions
 
         state_t = _as_tensor(state, self.device)
         self.qnetwork_local.eval()
@@ -347,7 +351,7 @@ class DQNAgent:
         q_values = q.detach().cpu().numpy().flatten().tolist()
         action = filter_q_values(q_values, potential_actions)
         skill_lvl = potential_skills[potential_actions.index(action)]
-        return action, skill_lvl
+        return action, skill_lvl, potential_actions
 
     def soft_update(self, local_model: torch.nn.Module, target_model: torch.nn.Module) -> None:
         """Polyak averaging update: target <- tau * local + (1-tau) * target."""
@@ -676,14 +680,18 @@ class FQFAgent:
         state: np.ndarray,
         all_ff_waiting,
         eps: float = 0.0,
-    ) -> Tuple[int, int]:
-        """Epsilon-greedy action selection based on expected value over quantiles."""
+    ) -> Tuple[int, int, List[int]]:
+        """Epsilon-greedy action selection based on expected value over quantiles.
+
+        Returns the feasible actions alongside the choice: callers use them for
+        explainability (which alternatives were available and rejected).
+        """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
 
         if np.random.uniform() <= eps:
             action = random.choice(potential_actions)
             skill_lvl = potential_skills[potential_actions.index(action)]
-            return action, skill_lvl
+            return action, skill_lvl, potential_actions
 
         state_t = torch.from_numpy(state.flatten()).float().to(self.device)
 
@@ -698,7 +706,7 @@ class FQFAgent:
         q_list = q.detach().cpu().numpy().flatten().tolist()
         action = filter_q_values(q_list, potential_actions)
         skill_lvl = potential_skills[potential_actions.index(action)]
-        return action, skill_lvl
+        return action, skill_lvl, potential_actions
 
     def soft_update(self, local_model: torch.nn.Module, target_model: torch.nn.Module) -> None:
         for target_param, local_param in zip(
@@ -1107,15 +1115,19 @@ class DTAgent:
         traj_actions: List[Tensor],
         traj_returns: List[Tensor],
         traj_timesteps: List[int],
-    ) -> Tuple[int, int]:
-        """Sample an action from the DT policy, masked to valid actions."""
+    ) -> Tuple[int, int, List[int]]:
+        """Sample an action from the DT policy, masked to valid actions.
+
+        Returns the feasible actions alongside the choice: callers use them for
+        explainability (which alternatives were available and rejected).
+        """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
 
         # Not enough history -> fallback to random valid action
         if not traj_states or not traj_actions or not traj_returns or not traj_timesteps:
             action = random.choice(potential_actions)
             skill_lvl = potential_skills[potential_actions.index(action)]
-            return action, skill_lvl
+            return action, skill_lvl, potential_actions
 
         states = torch.stack(traj_states[-self.max_len :]).unsqueeze(0).to(self.device)
         actions = torch.stack(traj_actions[-self.max_len :]).unsqueeze(0).to(self.device)
@@ -1138,7 +1150,7 @@ class DTAgent:
         self.dt_network.train()
 
         skill_lvl = potential_skills[potential_actions.index(action)]
-        return action, skill_lvl
+        return action, skill_lvl, potential_actions
 
     def store_trajectory(
         self,
@@ -1308,8 +1320,14 @@ class PPOAgent:
         self.actor_optimizer = optim.Adam(actor_parameters, lr=self.actor_lr)
         self.critic_optimizer = optim.Adam(critic_parameters, lr=self.critic_lr)
 
-    def act(self, state: np.ndarray, all_ff_waiting, eps: float = 0.0) -> Tuple[int, int]:
-        """Sample an action from the masked categorical distribution."""
+    def act(
+        self, state: np.ndarray, all_ff_waiting, eps: float = 0.0
+    ) -> Tuple[int, int, List[int]]:
+        """Sample an action from the masked categorical distribution.
+
+        Returns the feasible actions alongside the choice: callers use them for
+        explainability (which alternatives were available and rejected).
+        """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
         state_t = torch.from_numpy(state).float().to(self.device)
 
@@ -1330,7 +1348,7 @@ class PPOAgent:
 
         self.last_invalid_actions = invalid_actions
         skill_lvl = potential_skills[potential_actions.index(action)]
-        return action, skill_lvl
+        return action, skill_lvl, potential_actions
 
     def step(
         self,
