@@ -27,6 +27,7 @@ import pickle
 import torch
 
 from paths import DATA_ENVIRONMENT, resolve
+from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F401
 
 # Seed for the environment's downsampling draws. Exposed so callers can vary it
 # across replicates; the default keeps a plain run reproducible.
@@ -493,6 +494,18 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
     return dic_vehicles, dic_functions, df_skills, dic_roles_skills, dic_roles, planning, \
     dic_inter, dic_ff, dic_indic, dic_indic_old, Z_1, Z_4, dic_lent, dic_station_distance, df_pc, \
     old_date, date_reference, skills_updated
+
+
+def load_environment(constraint_factor_veh, constraint_factor_ff, dataset, start, end,
+                     seed=DEFAULT_SEED):
+    """Same as `load_environment_variables`, returning a named `Environment`.
+
+    The 18-tuple form is unpacked by position at every call site, so adding or
+    reordering a field breaks callers silently. Prefer this.
+    """
+    return Environment(*load_environment_variables(
+        constraint_factor_veh, constraint_factor_ff, dataset, start, end, seed
+    ))
 
 
 def gen_state(veh_depart, idx_role, ff_array, ff_existing, dic_roles, dic_roles_skills, dic_ff, df_skills, \
