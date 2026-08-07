@@ -37,6 +37,7 @@ import numpy as np
 from agent_explainable import *
 from collective_functions import *
 from explainability import *
+from paths import DATA, REWARD_WEIGHTS, SVG_MODEL, resolve
 
 from datetime import datetime, timedelta
 import torch
@@ -44,7 +45,6 @@ import json
 import argparse
 import re
 import ast
-import os
 import pickle
 from IPython.display import clear_output
 
@@ -64,14 +64,18 @@ if __name__ == "__main__":
     parser.add_argument("--top_n", type=int, help="nearest stations to consider")
     parser.add_argument("--reward_weights", type=str, help="JSON file with reward weights")
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
-    parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%, factor 3 is 33%")
-    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%, factor 3 is 33%")
+    parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
 
     args = parser.parse_args()
 
-    os.chdir('./Data')
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
-    hyper_params = json.load(open(args.hyper_params, "r"))
+    with open(resolve(args.hyper_params, DATA), "r") as f:
+        hyper_params = json.load(f)
     eps = args.eps_start
     compute = False
 
@@ -86,35 +90,32 @@ if __name__ == "__main__":
     elif args.agent_model == "ppo":
         agent = PPO_Agent(**hyper_params)
 
+    model_path = resolve(args.model_name, SVG_MODEL)
+
     if args.train:
         if args.load:
-            os.chdir('../SVG_model')
-            agent.qnetwork_local.load_state_dict(torch.load(args.model_name, weights_only=True))
+            agent.qnetwork_local.load_state_dict(torch.load(model_path, weights_only=True))
             print("Weights loaded")
         agent.qnetwork_local.train()
         print("Train mode", flush=True)
 
     else:
         eps = 0
-        os.chdir('../SVG_model')
-        agent.qnetwork_local.load_state_dict(torch.load(args.model_name, weights_only=True))
+        agent.qnetwork_local.load_state_dict(torch.load(model_path, weights_only=True))
         agent.qnetwork_local.eval()
-        
-        print("Eval mode - weights loaded", flush=True)   
 
-    os.chdir('../Reward_weights')
+        print("Eval mode - weights loaded", flush=True)
 
-    dic_tarif = json.load(open(args.reward_weights))
+    with open(resolve(args.reward_weights, REWARD_WEIGHTS)) as f:
+        dic_tarif = json.load(f)
     # print("Reward weights", dic_tarif)
-
-    os.chdir('../')
 
     ### LOAD ENVIRONMENT VARIABLES ###
 
     dic_vehicles, dic_functions, df_skills, dic_roles_skills, dic_roles, planning, dic_inter, \
     dic_ff, dic_indic, dic_indic_old, Z_1, Z_4, dic_lent, dic_station_distance, df_pc, old_date, date_reference, \
     skills_updated = load_environment_variables(args.constraint_factor_veh, args.constraint_factor_ff, \
-                                                args.dataset, args.start, args.end)
+                                                args.dataset, args.start, args.end, args.seed)
 
     vehicle_out, num_d, score, action_num = 0, 42, 0, 0
     all_ff_waiting, v_waiting, following_depart = (False,) * 3
@@ -138,7 +139,7 @@ if __name__ == "__main__":
     action_size = hyper_params["action_size"] # idx role + rl infos
     dic_indic_100 = dic_indic.copy()
 
-    os.chdir('../SVG_model')
+    SVG_MODEL.mkdir(parents=True, exist_ok=True)
 
     i = 0
     dic_saved_skills = {k:0 for k in range(0, 134)}
@@ -645,7 +646,7 @@ if __name__ == "__main__":
         #     clear_output(wait=True)
 
         if num_inter % 10000 == 0 and args.train and required_departure == {0:"RETURN"}:   
-            torch.save(agent.qnetwork_local.state_dict(), args.model_name)
+            torch.save(agent.qnetwork_local.state_dict(), model_path)
             print(num_inter, "Agent saved as", args.model_name, flush=True)
 
 

@@ -34,6 +34,7 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from base import BaseSynthesizer, random_state
+from paths import SVG_MODEL
 from data import prepare_fast_dataloader
 from gaussian_multinomial_diffusion import GaussianMultinomialDiffusion
 from utils_train import get_model, update_ema
@@ -393,12 +394,13 @@ class DDPM(BaseSynthesizer):
                     description.format(mloss=mloss, gloss=gloss)
                 )
 
+        SVG_MODEL.mkdir(parents=True, exist_ok=True)
         torch.save(
             self.diffusion._denoise_fn.state_dict(),
-            "./SVG_model/model_" + self.save_as + "_diffusion.pt",
+            SVG_MODEL / f"model_{self.save_as}_diffusion.pt",
         )
         torch.save(
-            self.ema_model.state_dict(), "./SVG_model/model_" + self.save_as + "_ema.pt"
+            self.ema_model.state_dict(), SVG_MODEL / f"model_{self.save_as}_ema.pt"
         )
 
     @random_state
@@ -464,7 +466,7 @@ class DDPM(BaseSynthesizer):
 
         denoiser.load_state_dict(
             torch.load(
-                "./SVG_model/model_" + self.load_as + "_diffusion.pt",
+                SVG_MODEL / f"model_{self.load_as}_diffusion.pt",
                 weights_only=True,
             )
         )

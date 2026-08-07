@@ -1,9 +1,9 @@
 import argparse
 import numpy as np
 import pandas as pd
-import os
 from tqdm import tqdm
 from collective_functions import *
+from paths import DATA_ENVIRONMENT, DATA_SAMPLED, resolve
 tqdm.pandas()
 
 
@@ -72,14 +72,11 @@ def main() -> None:
     parser.add_argument("--rarity", type=int, help="rarity threshold for skills")
     args = parser.parse_args()
     
-    os.chdir("./Data_sampled/")
-    df_pc = pd.read_pickle(args.dataset)
-    os.chdir('../')
+    df_pc = pd.read_pickle(resolve(args.dataset, DATA_SAMPLED))
 
-    os.chdir("./Data_environment/")
-    df_stations = pd.read_pickle("df_stations.pkl")
-    df_skills = pd.read_pickle("df_skills.pkl")
-    planning = pd.read_pickle("planning.pkl")
+    df_stations = pd.read_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
+    df_skills = pd.read_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
+    planning = pd.read_pickle(DATA_ENVIRONMENT / "planning.pkl")
 
     df_pc = df_pc[df_pc["departure"] != {0: 'RETURN'}]
     
@@ -93,16 +90,14 @@ def main() -> None:
                                                                                                     args.rarity),
                                                          axis=1)
 
-    df_pc.to_pickle("df_pc_rare_skills.pkl")
-    
-    df_pc_rs = pd.read_pickle("df_pc_rare_skills.pkl")
-    df_pc_real = pd.read_pickle("df_pc_real_prob.pkl")
-    
+    df_pc.to_pickle(DATA_ENVIRONMENT / "df_pc_rare_skills.pkl")
+
+    df_pc_rs = pd.read_pickle(DATA_ENVIRONMENT / "df_pc_rare_skills.pkl")
+    df_pc_real = pd.read_pickle(DATA_ENVIRONMENT / "df_pc_real_prob.pkl")
+
     df_pc_real["rare_skills_required"] = df_pc_real.index.map(lambda _: np.array([], dtype=int))
     df_pc_real.update(df_pc_rs["rare_skills_required"])
-    df_pc_real.to_pickle("df_pc_prob_rare_skills_merged.pkl")
-    
-    os.chdir('../')
+    df_pc_real.to_pickle(DATA_ENVIRONMENT / "df_pc_prob_rare_skills_merged.pkl")
 
 if __name__ == "__main__":
 

@@ -54,7 +54,7 @@ Outputs
 
 Notes
 -----
-- This script relies heavily on `os.chdir(...)`. It should be executed from the project root.
+- Paths come from `paths.py`, so the script can be run from any directory.
 """
 
 import argparse
@@ -70,6 +70,15 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 from sklearn.neighbors import KDTree
+
+from paths import (
+    DATA,
+    DATA_ENVIRONMENT,
+    DATA_PREPROCESSED,
+    DATA_SAMPLED,
+    DATA_TRAINED,
+    resolve,
+)
 
 
 def reorg_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -660,44 +669,40 @@ def main() -> None:
     Z_2 = ["ST JORY", "ROUFFIAC", "RAMONVILLE - BUCHENS", "COLOMIERS", "MURET - MASSAT"]
     Z_3 = ["AUTERIVE", "ST LYS", "GRENADE", "FRONTON", "VERFEIL", "CARAMAN"]
 
-    os.chdir("./Data")
+    df_firestations = pd.read_csv(DATA / "firestations.csv", sep=";")
+    df_materiel = pd.read_csv(DATA / "materiel.csv", sep=";")
+    df_comp = pd.read_csv(DATA / "comp.csv", sep=";")
+    df_roles = pd.read_csv(DATA / "roles_competences.csv", sep=";")
+    df_vehicles_history = pd.read_csv(DATA / "df_vehicles_history.csv", sep=";")
 
-    df_firestations = pd.read_csv("firestations.csv", sep=";")
-    df_materiel = pd.read_csv("materiel.csv", sep=";")
-    df_comp = pd.read_csv("comp.csv", sep=";")
-    df_roles = pd.read_csv("roles_competences.csv", sep=";")
-    df_vehicles_history = pd.read_csv("df_vehicles_history.csv", sep=";")
-
-    df_xy = pd.read_csv("X-Y-lieu.csv", sep=";")
-    df_lieu = pd.read_csv("dbo.LIEU.csv", sep=";")
-    df_secteur = pd.read_csv("dbo.SECTEUR.csv", sep=";")
-    df_commune = pd.read_csv("dbo.COMMUNE.csv", sep=";")
-    df_nom_commune = pd.read_csv("dbo.NOM_COMMUNE.csv", sep=";")
-    df_responses = pd.read_csv("responses_by_incident.csv", sep=";")
-    df_pdd = gpd.read_file("pdd.geojson")
+    df_xy = pd.read_csv(DATA / "X-Y-lieu.csv", sep=";")
+    df_lieu = pd.read_csv(DATA / "dbo.LIEU.csv", sep=";")
+    df_secteur = pd.read_csv(DATA / "dbo.SECTEUR.csv", sep=";")
+    df_commune = pd.read_csv(DATA / "dbo.COMMUNE.csv", sep=";")
+    df_nom_commune = pd.read_csv(DATA / "dbo.NOM_COMMUNE.csv", sep=";")
+    df_responses = pd.read_csv(DATA / "responses_by_incident.csv", sep=";")
+    df_pdd = gpd.read_file(DATA / "pdd.geojson")
 
     df_stations = generate_stations(df_firestations)
     stations_u = sorted(x for x in df_materiel["Nom du Centre"].unique() if not x.startswith("X") and not x.startswith("Z"))
     df_v = generate_vehicles(df_materiel, df_stations)
     df_skills, df_firefighters = generate_firefighters(df_comp)
 
-    os.chdir("../Data_environment")
-    df_stations.to_pickle("df_stations.pkl")
-    df_v.to_pickle("df_v.pkl")
-    df_skills.to_pickle("df_skills.pkl")
-    df_roles.to_pickle("df_roles.pkl")
-    df_vehicles_history.to_pickle("df_vehicles_history.pkl")
+    DATA_ENVIRONMENT.mkdir(parents=True, exist_ok=True)
+    df_stations.to_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
+    df_v.to_pickle(DATA_ENVIRONMENT / "df_v.pkl")
+    df_skills.to_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
+    df_roles.to_pickle(DATA_ENVIRONMENT / "df_roles.pkl")
+    df_vehicles_history.to_pickle(DATA_ENVIRONMENT / "df_vehicles_history.pkl")
 
-    os.chdir("../Data_preprocessed")
-    df_prob_dep = pd.read_pickle("df_prob_dep.pkl")
-    df_rank_incident = pd.read_pickle("df_rank_incident.pkl")
+    df_prob_dep = pd.read_pickle(DATA_PREPROCESSED / "df_prob_dep.pkl")
+    df_rank_incident = pd.read_pickle(DATA_PREPROCESSED / "df_rank_incident.pkl")
 
     dic_inc_ar_mat = create_responses(df_responses, df_rank_incident)
 
     # REAL
-    os.chdir("../Data_trained")
     is_fake = False
-    df_pc_real = pd.read_pickle("df_real.pkl")
+    df_pc_real = pd.read_pickle(DATA_TRAINED / "df_real.pkl")
     window = len(df_pc_real)
     print("window real:", window)
 
@@ -731,11 +736,9 @@ def main() -> None:
         max_val = df_pc_real[col].max()
         df_pc_real[col] = (df_pc_real[col] - min_val) / (max_val - min_val) if min_val != max_val else 0.0
 
-    os.chdir("../Data_environment")
-    df_pc_real.to_pickle("df_pc_real" + suffix + ".pkl")
+    df_pc_real.to_pickle(DATA_ENVIRONMENT / ("df_pc_real" + suffix + ".pkl"))
 
     # FAKE
-    os.chdir("../Data_sampled")
     is_fake = True
     dfs_to_concat = []
     start_year = 2018
@@ -745,13 +748,14 @@ def main() -> None:
 
     for sample_file in args.sample_list or []:
         start_inter += window
-        window = len(pd.read_pickle(sample_file))
+        sample_path = resolve(sample_file, DATA_SAMPLED)
+        window = len(pd.read_pickle(sample_path))
         print("window fake:", window)
         end_inter += window
 
         print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
 
-        df_pc_fake = pd.read_pickle(sample_file)
+        df_pc_fake = pd.read_pickle(sample_path)
         df_pc_fake = precompute_pdd(df_pdd, df_pc_fake, stations_u)
         df_pc_fake = precompute_zone(df_stations, df_pc_fake, Z_1, Z_2, Z_3)
         df_pc_fake = precompute_incident(df_rank_incident, df_pc_fake)
@@ -778,22 +782,17 @@ def main() -> None:
             max_val = df_pc_fake[col].max()
             df_pc_fake[col] = (df_pc_fake[col] - min_val) / (max_val - min_val) if min_val != max_val else 0.0
 
-        os.chdir("../Data_environment")
-        df_pc_fake.to_pickle(args.save_as)
+        df_pc_fake.to_pickle(resolve(args.save_as, DATA_ENVIRONMENT))
         print("global fake done", len(df_pc_fake))
     else:
-        os.chdir("../Data_environment")
         print("No fake samples provided; skipping fake stream generation.")
 
     # Planning
-    os.chdir("../Data")
-    planning = create_dic_planning("./Planning/")
+    planning = create_dic_planning(str(DATA / "Planning") + "/")
 
-    os.chdir("../Data_environment")
-    pickle.dump(planning, open("planning.pkl", "wb"))
+    with open(DATA_ENVIRONMENT / "planning.pkl", "wb") as f:
+        pickle.dump(planning, f)
     print("Planning done")
-
-    os.chdir("../")
 
 
 if __name__ == "__main__":

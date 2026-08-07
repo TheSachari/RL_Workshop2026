@@ -26,6 +26,12 @@ import json
 import pickle
 import torch
 
+from paths import DATA_ENVIRONMENT, resolve
+
+# Seed for the environment's downsampling draws. Exposed so callers can vary it
+# across replicates; the default keeps a plain run reproducible.
+DEFAULT_SEED = 42
+
 def get_skills_from_role(df_roles, role):
     """
     Return the skill requirement expression for a given role.
@@ -350,7 +356,8 @@ def get_neighborhood_availability(pdd, station, num_d, dic_vehicles, planning, m
         info_avail = [0] * n_following * 2
     return info_avail
 
-def load_environment_variables(constraint_factor_veh, constraint_factor_ff, dataset, start, end):
+def load_environment_variables(constraint_factor_veh, constraint_factor_ff, dataset, start, end,
+                               seed=DEFAULT_SEED):
 
     """
     Load environment artifacts and slice the event stream to a given intervention interval.
@@ -363,11 +370,15 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
     constraint_factor_ff : int
         Firefighter constraint factor (random downsampling of the skill table).
     dataset : str
-        Path (relative to `./Data_environment/`) to the pickled event stream DataFrame (df_pc).
+        Filename inside `Data_environment/` (or an explicit path) of the pickled
+        event stream DataFrame (df_pc).
     start : int
         First intervention id (num_inter) to include (departure event).
     end : int
         Last intervention id (num_inter) to include (RETURN event).
+    seed : int
+        Seed for the two downsampling draws (vehicles and firefighters). Both are
+        seeded explicitly, so the same seed always yields the same environment.
 
     Returns
     -------
@@ -393,46 +404,45 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
         - old_date/date_reference: reference timestamps for duration/skill updates
         - skills_updated: binary matrix of which skills are currently valid
 
-    Side Effects
-    ------------
-    Changes working directory to `./Data_environment` during loading.
-
     Notes
     -----
     This is the canonical loader for both heuristic simulation and RL training/evaluation.
     """
 
-    os.chdir('./Data_environment')
+    df_stations = pd.read_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
 
-    df_stations = pd.read_pickle("df_stations.pkl")
-
-    df_v = pd.read_pickle("df_v.pkl")
+    df_v = pd.read_pickle(DATA_ENVIRONMENT / "df_v.pkl")
     dic_vehicles, dic_functions = create_dic_vehicles(df_v)
     dic_vehicles = purge_dic_v(dic_vehicles)
 
     print("constraint factor veh is ", constraint_factor_veh)
     
     list_of_mats = dic_vehicles["TOULOUSE - VION"]["available"]
-    dic_vehicles["TOULOUSE - VION"]["available"] = constrain_veh(list_of_mats, constraint_factor_veh)
-    
+    dic_vehicles["TOULOUSE - VION"]["available"] = constrain_veh(list_of_mats, constraint_factor_veh, seed)
+
     list_of_mats = dic_vehicles["TOULOUSE - LOUGNON"]["available"]
-    dic_vehicles["TOULOUSE - LOUGNON"]["available"] = constrain_veh(list_of_mats, constraint_factor_veh)
+    dic_vehicles["TOULOUSE - LOUGNON"]["available"] = constrain_veh(list_of_mats, constraint_factor_veh, seed)
 
-    df_skills = pd.read_pickle("df_skills.pkl")
+    df_skills = pd.read_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
 
-    df_skills = df_skills.sample(len(df_skills)//constraint_factor_ff)
+    # random_state is required: DataFrame.sample draws from numpy's global RNG,
+    # which random.seed() does not control. Without it the workforce was redrawn
+    # on every run and the same command produced different metrics. Note this
+    # also matters at factor 1, where the set is unchanged but the *order* is
+    # not, and roles are assigned by scanning firefighters in order.
+    df_skills = df_skills.sample(len(df_skills)//constraint_factor_ff, random_state=seed)
     print("constraint factor ff is ", constraint_factor_ff)
-    
-    df_roles = pd.read_pickle("df_roles.pkl")
+
+    df_roles = pd.read_pickle(DATA_ENVIRONMENT / "df_roles.pkl")
     dic_roles_skills = generate_dic_roles_skills(df_roles, df_skills)
 
-    df_vehicles_history = pd.read_pickle("df_vehicles_history.pkl")
+    df_vehicles_history = pd.read_pickle(DATA_ENVIRONMENT / "df_vehicles_history.pkl")
     dic_roles = create_dic_roles(df_vehicles_history)
-    
-    with open("planning.pkl", "rb") as file:
+
+    with open(DATA_ENVIRONMENT / "planning.pkl", "rb") as file:
         planning = pickle.load(file)
 
-    df_pc = pd.read_pickle(dataset) #, sep = ';', parse_dates=["date"], converters={"PDD": ast.literal_eval, "departure": ast.literal_eval})
+    df_pc = pd.read_pickle(resolve(dataset, DATA_ENVIRONMENT))
 
     dic_inter = {i:{} for i in range(1, int(len(df_pc)/2)+1)} # num_inter:station:mat_v:mat_ff
     

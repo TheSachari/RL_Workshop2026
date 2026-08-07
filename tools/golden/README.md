@@ -31,34 +31,28 @@ refuses to store a reference that is not itself reproducible.
 | `determinism.py` | seeds every RNG the simulation touches |
 | `compare.py` | standalone diff of one metrics pickle vs a reference |
 
-## Two things this harness works around
+## Two bugs this harness caught (both now fixed)
 
-**1. The runs were not reproducible.** `load_environment_variables` calls
+**1. The runs were not reproducible.** `load_environment_variables` sampled the
+skill table with no `random_state`. `DataFrame.sample` draws from the *numpy*
+global RNG, which the `random.seed(42)` in `constrain_veh` does not control, so
+every run used a different set of firefighters. Two identical commands differed
+on 10 of 21 metrics (`rupture_ff` 288 vs 305, `v_degraded` 11 vs 13, …).
 
-```python
-df_skills = df_skills.sample(len(df_skills) // constraint_factor_ff)
-```
-
-([`collective_functions.py:423`](../../collective_functions.py)) with no
-`random_state`. `DataFrame.sample` draws from the *numpy* global RNG, which the
-`random.seed(42)` in `constrain_veh` does not control, so every run used a
-different set of firefighters. Two identical commands differed on 10 of 21
-metrics (`rupture_ff` 288 vs 305, `v_degraded` 11 vs 13, …).
-
-`--constraint_factor_ff 1` is affected too: the selected *set* is the whole
+`--constraint_factor_ff 1` was affected too: the selected *set* is the whole
 table, but `sample` returns it in a shuffled *order*, and roles are assigned by
 scanning firefighters in order.
 
-`determinism.py` seeds this from the outside, leaving repo sources untouched at
-this stage. **When the refactor threads an explicit seed through the loader, that
-shim should be deleted** and the fix made in the loader itself.
+Fixed in Étape 1: the loader takes an explicit `seed` (default 42), threaded
+through from `--seed` on both simulation scripts. `determinism.py` no longer
+patches `sample` — the golden references still match without it, which is the
+evidence the fix is real and not propped up by the harness.
 
-**2. Runs write outside their working directory.** The scripts navigate with
-`os.chdir` and save to `../Plots` relative to the data folder they last entered —
-so a run launched from the wrong place drops its results into the *source data*
-tree. `make_workspace.py` therefore builds `Data_environment/` as a real
-directory of per-file symlinks (not a symlink to the folder), which keeps `..`
-inside the workspace.
+**2. Runs wrote outside their working directory.** The scripts navigated with
+`os.chdir` and saved to `../Plots` relative to the data folder they last
+entered, so a run launched from the wrong place dropped its results into the
+*source data* tree. Fixed in Étape 1 by `paths.py`; `run_golden.py` sets
+`RL_DATA_ROOT` to the workspace so outputs stay contained.
 
 ## Coverage
 

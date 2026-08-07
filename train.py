@@ -18,19 +18,19 @@ Pipeline overview
 
 Notes
 -----
-- This script relies on multiple `os.chdir(...)` calls and therefore assumes a
-  specific project directory structure.
+- Paths come from `paths.py`, so the script can be run from any directory.
 - The "Incident" column is shifted to zero-based indexing (Incident -= 1),
   which is required by the downstream DDPM / tabular pipeline.
 """
 
 import argparse
-import os
 import pickle
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import QuantileTransformer
+
+from paths import DATA_PREPROCESSED, DATA_TRAINED
 
 from data import *
 from ddpm import DDPM
@@ -195,13 +195,11 @@ if __name__ == "__main__":
     - The "Incident" variable is shifted to zero-based indexing.
     """
 
-    os.chdir("./Data_preprocessed")
-
-    df_real = pd.read_pickle("df_real.pkl")
+    df_real = pd.read_pickle(DATA_PREPROCESSED / "df_real.pkl")
 
     print(df_real.columns)
 
-    os.chdir("../Data_trained/")
+    DATA_TRAINED.mkdir(parents=True, exist_ok=True)
 
     df_sincos = sincos_transform(df_real.copy())
 
@@ -212,7 +210,7 @@ if __name__ == "__main__":
         ["Coord X", "Coord Y", "Duration", "Incident", "Month", "Day", "Hour", "Minute"]
     ].copy()
     print(df_real_temp.columns)
-    df_real_temp.to_pickle("df_real.pkl")
+    df_real_temp.to_pickle(DATA_TRAINED / "df_real.pkl")
 
     df_sincos[["Coord X", "Coord Y", "Duration", "Incident"]] = df_real[
         ["Coord X", "Coord Y", "Duration", "Incident"]
@@ -224,13 +222,15 @@ if __name__ == "__main__":
 
     df_quantile, normalizer_ddpm = quantile_transform(df_sincos)
 
-    df_quantile.to_pickle("df_quantile.pkl")
+    df_quantile.to_pickle(DATA_TRAINED / "df_quantile.pkl")
 
-    pickle.dump(normalizer_ddpm, open("normalizer_ddpm.pkl", "wb"))
+    with open(DATA_TRAINED / "normalizer_ddpm.pkl", "wb") as f:
+        pickle.dump(normalizer_ddpm, f)
 
     dataset = raw_dataset_from_df(df_quantile, [], dummy=False, col="Incident")
 
-    pickle.dump(dataset, open("dataset.pkl", "wb"))
+    with open(DATA_TRAINED / "dataset.pkl", "wb") as f:
+        pickle.dump(dataset, f)
 
     parser = argparse.ArgumentParser(description="Train_params")
     parser.add_argument("--epochs", type=int, default=20000, help="Number of epochs")
@@ -277,8 +277,6 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", help="device")
 
     args = parser.parse_args()
-
-    os.chdir("../")
 
     ddpm = DDPM(
         lr=args.lr,

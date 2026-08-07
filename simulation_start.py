@@ -3,7 +3,6 @@ import numpy as np
 import random
 import pickle
 import argparse
-import os
 import re
 import ast
 import json
@@ -12,6 +11,7 @@ from IPython.display import clear_output
 from tqdm.auto import tqdm
 
 from collective_functions import *
+from paths import PLOTS, resolve
 
 #########################################################################################
 
@@ -23,10 +23,14 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, help="start from num_inter")
     parser.add_argument("--end", type=int, help="end after num_inter")
     parser.add_argument("--save_metrics_as", type=str, help="save dic_indic as")
-    parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%, factor 3 is 33%")
-    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%, factor 3 is 33%")
+    parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
 
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
     if args.is_best:
         print("logic is best")
@@ -38,7 +42,7 @@ if __name__ == "__main__":
     dic_vehicles, dic_functions, df_skills, dic_roles_skills, dic_roles, planning, dic_inter, \
     dic_ff, dic_indic, dic_indic_old, Z_1, Z_4, dic_lent, dic_station_distance, df_pc, old_date, date_reference, \
     skills_updated = load_environment_variables(args.constraint_factor_veh, args.constraint_factor_ff, \
-                                                args.dataset, args.start, args.end)
+                                                args.dataset, args.start, args.end, args.seed)
     
     vehicle_out, num_d, score, action_num = 0, 42, 0, 0
     all_ff_waiting, v_waiting, following_depart = (False,) * 3
@@ -505,11 +509,11 @@ if __name__ == "__main__":
 
     print("Simulation done")
 
-    os.chdir('../Plots')
-
     # np.save(args.save_metrics_as + "_vehicle_" + args.dataset[6:10] +".npy", vehicle_evo)
 
-    pickle.dump(dic_indic, open(args.save_metrics_as + ".pkl", "wb"))
-
-    os.chdir('../')
+    PLOTS.mkdir(parents=True, exist_ok=True)
+    metrics_path = resolve(args.save_metrics_as + ".pkl", PLOTS)
+    with open(metrics_path, "wb") as f:
+        pickle.dump(dic_indic, f)
+    print("Metrics saved to", metrics_path)
 

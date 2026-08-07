@@ -1,3 +1,29 @@
+# Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Scripts resolve their paths through `paths.py`, so they can be run from any
+directory. By default the data folders are expected next to the repo; point
+`RL_DATA_ROOT` elsewhere to keep the data outside it:
+
+```bash
+export RL_DATA_ROOT=/path/to/data
+```
+
+Both simulation scripts take `--seed` (default 42), which fixes the vehicle and
+firefighter downsampling draws. The same seed always yields the same
+environment; vary it across replicates.
+
+Before and after changing anything, check that behaviour has not moved:
+
+```bash
+python tools/golden/run_cases.py check --data-root "$RL_DATA_ROOT"
+```
+
+See [tools/golden/README.md](tools/golden/README.md).
+
 # Preprocessing
 
 ```python3 preprocess.py --inters inters.csv --sorties sorties.csv --pdd pdd.geojson --materiel materiel.csv```

@@ -8,7 +8,6 @@ imported without triggering I/O. When run as a script, it loads raw files from
 `./Data/`, runs preprocessing, and writes pickled artifacts to `./Data_preprocessed/`.
 """
 
-import os
 import re
 
 import argparse
@@ -16,6 +15,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely import MultiPolygon, Point, unary_union
+
+from paths import DATA, DATA_PREPROCESSED, ensure_dirs, resolve
 
 
 def replace_vl_prefix(lst):
@@ -363,42 +364,23 @@ def main() -> None:
     parser.add_argument("--materiel", type=str, help="materiel filename")
     args = parser.parse_args()
 
-    
-    li_dir_name = [
-        "Data_preprocessed",
-        "Data_trained",
-        "Data_sampled",
-        "Data_environment",
-        "SVG_model",
-        "Plots",
-        "Reward_weights",
-    ]
+    ensure_dirs()
 
-    for dir_name in li_dir_name:
-        if not os.path.exists(dir_name):
-            os.makedirs(dir_name)
+    df_inter = pd.read_csv(resolve(args.inters, DATA), sep=";")
 
-    os.chdir("./Data")
+    df_sorties = pd.read_csv(resolve(args.sorties, DATA), sep=";")
 
+    df_pdd = gpd.read_file(resolve(args.pdd, DATA))
 
-    df_inter = pd.read_csv(args.inters, sep=";")
-
-    df_sorties = pd.read_csv(args.sorties, sep=";")
-
-    df_pdd = gpd.read_file(args.pdd)
-
-    df_materiel = pd.read_csv(args.materiel, sep=";")
+    df_materiel = pd.read_csv(resolve(args.materiel, DATA), sep=";")
 
     df_real, df_prob_dep, df_rank_incident = preprocess(
         df_pdd, df_sorties, df_inter, df_materiel
     )
 
-    svg_path = "../Data_preprocessed/"
-    df_real.to_pickle(svg_path + "df_real.pkl")
-    df_prob_dep.to_pickle(svg_path + "df_prob_dep.pkl")
-    df_rank_incident.to_pickle(svg_path + "df_rank_incident.pkl")
-
-    os.chdir("../")
+    df_real.to_pickle(DATA_PREPROCESSED / "df_real.pkl")
+    df_prob_dep.to_pickle(DATA_PREPROCESSED / "df_prob_dep.pkl")
+    df_rank_incident.to_pickle(DATA_PREPROCESSED / "df_rank_incident.pkl")
 
     print(len(df_real), "Preprocess done")
 

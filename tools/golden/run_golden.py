@@ -65,6 +65,10 @@ def main() -> None:
     seed = determinism.apply()
     print(f"[golden] seed={seed} workspace={workspace}", flush=True)
 
+    # Point the code's path resolution at the workspace, so results land inside
+    # it rather than in the read-only data tree it symlinks to.
+    os.environ["RL_DATA_ROOT"] = str(workspace)
+
     sys.path.insert(0, str(REPO_ROOT))
     os.chdir(workspace)
 

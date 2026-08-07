@@ -34,8 +34,7 @@ Outputs
 
 Notes
 -----
-- This script relies heavily on relative paths and `os.chdir(...)`. It should be run from
-  the project root so paths resolve as expected.
+- Paths come from `paths.py`, so the script can be run from any directory.
 - The code duplicates a few helper functions from preprocess.py (union_iris, get_point_in_area, ...).
   If you want to reduce duplication, you can import them from preprocess.py once that module is
   made import-safe (i.e., no side effects at import time).
@@ -44,7 +43,6 @@ Notes
 """
 
 import argparse
-import os
 import pickle
 from random import getrandbits, uniform
 
@@ -55,6 +53,7 @@ from shapely import MultiPolygon, Point, unary_union
 
 from data import *  # noqa: F403
 from ddpm import DDPM
+from paths import DATA, DATA_PREPROCESSED, DATA_SAMPLED, DATA_TRAINED, resolve
 
 
 def quantile_inverse_transform(df_res: pd.DataFrame, normalizer_ddpm) -> pd.DataFrame:
@@ -371,11 +370,9 @@ def main() -> None:
     Parses arguments, runs DDPM sampling, applies inverse transforms and spatial/temporal
     post-processing, then writes pickled outputs under `./Data_sampled/`.
     """
-    os.chdir("./Data_preprocessed")
-    df_real = pd.read_pickle("df_real.pkl")
+    df_real = pd.read_pickle(DATA_PREPROCESSED / "df_real.pkl")
 
-    os.chdir("../Data_trained")
-    with open("dataset.pkl", "rb") as file:
+    with open(DATA_TRAINED / "dataset.pkl", "rb") as file:
         dataset = pickle.load(file)
 
     parser = argparse.ArgumentParser(description="Train_params")
@@ -407,7 +404,7 @@ def main() -> None:
         "--pressure",
         type=float,
         default=1.,
-        help="Number of interventions to sample, 1 is 100% from real dataset",
+        help="Number of interventions to sample, 1 is 100%% from real dataset",
     )
     parser.add_argument("--to_keep", type=int, default=10, help="nb of highest values to keep by harmonization")
     parser.add_argument("--value_span", type=int, default=25, help="nb of interventions to permute by harmonization")
@@ -428,8 +425,6 @@ def main() -> None:
         args.variability,
         flush=True,
     )
-
-    os.chdir("../")
 
     ddpm = DDPM(
         lr=args.lr,
@@ -455,10 +450,10 @@ def main() -> None:
     num_samples = len(df_real) * args.os_factor
     X_gen, y_gen = ddpm.sample(dataset, num_samples, args.sample_batch_size)
 
-    os.chdir("./Data_trained")
-
-    df_quantile = pickle.load(open("df_quantile.pkl", "rb"))
-    normalizer_ddpm = pickle.load(open("normalizer_ddpm.pkl", "rb"))
+    with open(DATA_TRAINED / "df_quantile.pkl", "rb") as f:
+        df_quantile = pickle.load(f)
+    with open(DATA_TRAINED / "normalizer_ddpm.pkl", "rb") as f:
+        normalizer_ddpm = pickle.load(f)
 
     cols = list(df_quantile.columns)
     cols.remove("Incident")  # to match the generated X dimension
@@ -471,10 +466,7 @@ def main() -> None:
         ["Month_sin", "Month_cos", "Day_sin", "Day_cos", "Hour_sin", "Hour_cos"]
     ] = df_res[["Month_sin", "Month_cos", "Day_sin", "Day_cos", "Hour_sin", "Hour_cos"]]
 
-    os.chdir("../Data")
-
-    filename = "pdd.geojson"
-    df_pdd = gpd.read_file(filename)
+    df_pdd = gpd.read_file(DATA / "pdd.geojson")
 
     zones = union_iris(
         df_pdd,
@@ -506,12 +498,11 @@ def main() -> None:
     df_fake = new_df_sample(df_new_samples, "area_name", df_oversampled)
     df_fake = post_process(df_fake)
 
-    os.chdir("../Data_sampled")
-
-    df_fake.to_pickle("df_fake_woh.pkl")
+    DATA_SAMPLED.mkdir(parents=True, exist_ok=True)
+    df_fake.to_pickle(DATA_SAMPLED / "df_fake_woh.pkl")
 
     df_fake = harmonize(df_fake, args.to_keep, args.value_span, 365)
-    df_fake.to_pickle(args.save_sample_as)
+    df_fake.to_pickle(resolve(args.save_sample_as, DATA_SAMPLED))
 
     print(df_fake.shape, flush=True)
     print(df_fake.columns, flush=True)
@@ -520,7 +511,6 @@ def main() -> None:
     df_fake.to_pickle(args.save_sample_as)
 
     print("dataset sampled", flush=True)
-    os.chdir("../")
 
 
 if __name__ == "__main__":
