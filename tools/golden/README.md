@@ -63,8 +63,29 @@ about to merge are therefore pinned.
 The agent case runs in `--train` mode from a fresh seeded init rather than from a
 checkpoint: no checkpoint exists for the current agent API. Weights are only
 saved every 10000 interventions, so a 400-intervention run writes none — the run
-does not mutate anything on disk. `fixtures/hyper_params_fqf.json` sets
-`device: cpu`, since GPU kernels are not bit-reproducible across machines.
+does not mutate anything on disk.
+
+### The references are device-specific
+
+`fixtures/hyper_params_fqf.json` sets `device: cuda`. On this machine that is
+~5x faster than CPU (52 s vs 4 min 18 s for the agent case) and reproducible run
+to run, with `CUBLAS_WORKSPACE_CONFIG` and the deterministic-algorithm flags set
+in `determinism.py`.
+
+**Floating-point accumulation order differs between backends, so a reference
+recorded on GPU will not match a CPU run** — about half the agent metrics move
+(`rupture_ff` 1349 on CPU vs 1327 on GPU). The four heuristic cases are
+unaffected either way: they never touch torch.
+
+So on a machine with a different GPU, or with no GPU, `check` will report a
+regression on `agent_fqf_train` that is not one. Re-record in that case:
+
+```bash
+python tools/golden/run_cases.py record --data-root "$RL_DATA_ROOT"
+```
+
+and compare *within* a machine, not across. Set `device: cpu` in the fixture if
+you need a reference that is portable rather than fast.
 
 ## Known issues this harness had to work around
 
