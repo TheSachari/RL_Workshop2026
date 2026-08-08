@@ -60,6 +60,12 @@ station coverage polygons (`pdd` = *plus proche destination*), and the vehicle
 inventory. Filenames are passed rather than hardcoded because the yearly
 exports carry the year in their name (`sorties_2018.csv` and friends).
 
+The reference dataset covers **one calendar year** — the shipped `inters.csv`
+runs from 2018-01-01 to 2018-12-31, 53 088 interventions. Everything downstream
+inherits that: the generative model learns a single year's seasonality, and the
+synthetic years are replays of it under a different label (see `--start_year`
+in step 4).
+
 **Check the output before going further.** `Duration` silently went to zero on
 older pandas, and every later step depends on it:
 
@@ -163,7 +169,8 @@ RETURN event — hence output twice the input length.
 | parameter | value | why |
 |---|---|---|
 | `--prob_dep` | on | Draws the required vehicles from the historical distribution for that incident type and area, instead of the single most frequent departure. Keeps the rare, heavy departures the agent has to cope with; without it the mix is deterministic and too easy. |
-| `--sample_list` | 10 files | Concatenated in order, one calendar year each starting at 2018. `num_inter` continues across years, so the decade is one timeline rather than ten overlapping ones. |
+| `--sample_list` | 10 files | Concatenated in order, one calendar year each. `num_inter` continues across years, so the decade is one timeline rather than ten overlapping ones. |
+| `--start_year` | current year | Calendar year stamped on the first generated year; each further sample takes the next one. **This only labels the timeline — it does not change what was sampled.** It does decide which years are leap, and therefore which get a 366th day. Pass `--start_year 2018` to align the labels with the year the source data actually covers. |
 | `--save_as` | — | Output name in `Data_environment/`. |
 
 Two things this step does that are worth knowing:
@@ -171,12 +178,13 @@ Two things this step does that are worth knowing:
 - **It regenerates the real stream too**, unconditionally — `df_pc_real_prob.pkl`
   is rewritten even when only `--sample_list` fake years are requested. This is
   what clobbers the golden inputs (see step 0).
-- **Leap years get their 366th day.** The generative model only ever saw 2018
-  (365 days), so 2020 and 2024 would otherwise stop on 30 December. A day drawn
+- **Leap years get their 366th day.** The generative model only ever saw a
+  365-day year, so a leap year would otherwise stop on 30 December. A day drawn
   from the turn of the year is replayed onto day 366 — the donor comes from late
   December or early January because activity is seasonal (~162 interventions/day
   in December against ~202 in June), so an arbitrary day would land a summer
-  profile on a winter date.
+  profile on a winter date. Which years are affected follows from
+  `--start_year`: two of them in any ten-year span.
 
 Sanity check:
 
@@ -184,11 +192,12 @@ Sanity check:
 import pandas as pd
 d = pd.read_pickle("Data_environment/df_pc_fake_10y_prob_p12.pkl")
 dep = d[d["departure"] != {0: "RETURN"}]
-print(len(d), dep["date"].dt.normalize().nunique())   # 1274488, 3652 days
+print(len(d), dep["date"].dt.normalize().nunique())   # ~1274488, 3652 days
 ```
 
-3652 = 8×365 + 2×366 (2020 and 2024 are leap years). Anything less means a
-calendar hole.
+3652 = 8×365 + 2×366 — a ten-year span always contains two leap years. Anything
+less means a calendar hole. The row count moves slightly with `--start_year`,
+since the replayed leap days differ.
 
 ---
 

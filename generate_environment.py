@@ -473,10 +473,11 @@ def add_leap_day(
 ) -> pd.DataFrame:
     """Give a leap year its 366th day, by replaying a nearby sampled day.
 
-    The generator draws each synthetic year from a model fitted on 2018, which
-    has 365 days, so `Day` never exceeds 365. Laid onto a leap year that leaves
-    the calendar a day short: 2020 and 2024 would run to 30 December and skip
-    the 31st, putting a one-day hole in an otherwise continuous stream.
+    The generator draws each synthetic year from a model fitted on a single
+    365-day year, so `Day` never exceeds 365. Laid onto a leap year that leaves
+    the calendar a day short: the year would run to 30 December and skip the
+    31st, putting a one-day hole in an otherwise continuous stream. Which years
+    are affected follows from `--start_year`.
 
     Day 366 falls on 31 December, so the donor is drawn from the turn of the
     year — late December or early January — rather than from the year at large.
@@ -705,6 +706,13 @@ def main() -> None:
     parser.add_argument("--prob_dep", action="store_true", help="if departure is computed from probabilities")
     parser.add_argument("--sample_list", nargs="+", help="List of samples to use")
     parser.add_argument("--save_as", type=str, help="Output pickle name for the combined fake stream")
+    parser.add_argument(
+        "--start_year",
+        type=int,
+        default=datetime.now().year,
+        help="calendar year the first generated year is stamped with; each "
+             "further sample takes the next year (default: the current year)",
+    )
     args = parser.parse_args()
 
     print("is probabilistic departure", args.prob_dep)
@@ -765,7 +773,7 @@ def main() -> None:
         df_pc_real = precompute_departure(df_pc_real, dic_inc_ar_mat)
         suffix = ""
 
-    start_year = 2018
+    start_year = args.start_year
     start_inter = 1
     end_inter = window
     print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
@@ -785,7 +793,7 @@ def main() -> None:
     # FAKE
     is_fake = True
     dfs_to_concat = []
-    start_year = 2018
+    start_year = args.start_year
     start_inter = 1
     window = 0
     end_inter = 0
