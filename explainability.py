@@ -73,34 +73,63 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Environment params")
     parser.add_argument("--dataset", type=str, help="name of dataset")
     parser.add_argument("--rarity", type=int, help="rarity threshold for skills")
+    parser.add_argument(
+        "--from_dir",
+        type=str,
+        choices=("sampled", "environment"),
+        default="sampled",
+        help="folder holding --dataset: Data_sampled (default) or Data_environment",
+    )
+    parser.add_argument(
+        "--merge_into",
+        type=str,
+        default="df_pc_real_prob.pkl",
+        help="event stream in Data_environment to carry the rare skills",
+    )
+    parser.add_argument(
+        "--save_as",
+        type=str,
+        default="df_pc_prob_rare_skills_merged.pkl",
+        help="output name in Data_environment",
+    )
+    parser.add_argument(
+        "--save_rare_as",
+        type=str,
+        default="df_pc_rare_skills.pkl",
+        help="intermediate (departures only) name in Data_environment",
+    )
     args = parser.parse_args()
-    
-    df_pc = pd.read_pickle(resolve(args.dataset, DATA_SAMPLED))
+
+    source = DATA_SAMPLED if args.from_dir == "sampled" else DATA_ENVIRONMENT
+    df_pc = pd.read_pickle(resolve(args.dataset, source))
 
     df_stations = pd.read_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
     df_skills = pd.read_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
     planning = pd.read_pickle(DATA_ENVIRONMENT / "planning.pkl")
 
+    # Rare skills are a property of the crew on duty when a departure is
+    # requested, so RETURN rows are dropped here and given empty arrays by the
+    # merge below, which puts them back.
     df_pc = df_pc[df_pc["departure"] != {0: 'RETURN'}]
-    
-    df_pc["rare_skills_required"] = df_pc.progress_apply(lambda row: get_rare_skills_from_planed_ff(row["date"], 
-                                                                                                    row["Month"], 
-                                                                                                    row["Day"], 
-                                                                                                    row["Hour"], 
-                                                                                                    planning, 
-                                                                                                    df_stations, 
-                                                                                                    df_skills, 
+
+    df_pc["rare_skills_required"] = df_pc.progress_apply(lambda row: get_rare_skills_from_planed_ff(row["date"],
+                                                                                                    row["Month"],
+                                                                                                    row["Day"],
+                                                                                                    row["Hour"],
+                                                                                                    planning,
+                                                                                                    df_stations,
+                                                                                                    df_skills,
                                                                                                     args.rarity),
                                                          axis=1)
 
-    df_pc.to_pickle(DATA_ENVIRONMENT / "df_pc_rare_skills.pkl")
+    df_pc.to_pickle(DATA_ENVIRONMENT / args.save_rare_as)
 
-    df_pc_rs = pd.read_pickle(DATA_ENVIRONMENT / "df_pc_rare_skills.pkl")
-    df_pc_real = pd.read_pickle(DATA_ENVIRONMENT / "df_pc_real_prob.pkl")
+    df_pc_rs = pd.read_pickle(DATA_ENVIRONMENT / args.save_rare_as)
+    df_pc_full = pd.read_pickle(DATA_ENVIRONMENT / args.merge_into)
 
-    df_pc_real["rare_skills_required"] = df_pc_real.index.map(lambda _: np.array([], dtype=int))
-    df_pc_real.update(df_pc_rs["rare_skills_required"])
-    df_pc_real.to_pickle(DATA_ENVIRONMENT / "df_pc_prob_rare_skills_merged.pkl")
+    df_pc_full["rare_skills_required"] = df_pc_full.index.map(lambda _: np.array([], dtype=int))
+    df_pc_full.update(df_pc_rs["rare_skills_required"])
+    df_pc_full.to_pickle(DATA_ENVIRONMENT / args.save_as)
 
 if __name__ == "__main__":
 
