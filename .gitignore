@@ -22,6 +22,11 @@ SVG_model/
 Plots/
 Reward_weights/
 
+# A copy of the data tree kept inside the repo to run the golden cases
+# (tools/golden/run_cases.py --data-root Git_version_final). The entries above
+# are anchored to the repo root, so they do not cover it when it is nested.
+Git_version_final/
+
 # Model weights and datasets
 *.pkl
 *.pt
