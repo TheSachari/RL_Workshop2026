@@ -14,19 +14,19 @@
     "--constraint_factor_ff",
     "1"
   ],
-  "recorded_utc": "2026-08-07T16:51:51+00:00",
+  "recorded_utc": "2026-08-08T08:36:25+00:00",
   "metrics": {
     "v_required": 535,
-    "v_sent": 536,
-    "v_sent_full": 532,
+    "v_sent": 537,
+    "v_sent_full": 533,
     "v_degraded": 4,
-    "rupture_ff": 109,
-    "function_not_found": 138,
-    "v1_not_sent_from_s1": 118,
-    "v3_not_sent_from_s3": 14,
-    "v_not_found_in_last_station": 3,
+    "rupture_ff": 35,
+    "function_not_found": 122,
+    "v1_not_sent_from_s1": 89,
+    "v3_not_sent_from_s3": 12,
+    "v_not_found_in_last_station": 2,
     "ff_required": 0,
-    "ff_sent": 1711,
+    "ff_sent": 1713,
     "z1_VSAV_sent": 2,
     "z1_FPT_sent": 0,
     "z1_EPA_sent": 0,
@@ -36,6 +36,6 @@
     "VSAV_disp": 2,
     "FPT_disp": 5,
     "EPA_disp": 0,
-    "skill_lvl": 1989.0
+    "skill_lvl": 1971.0
   }
 }

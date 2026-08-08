@@ -13,7 +13,7 @@
     "--constraint_factor_ff",
     "3"
   ],
-  "recorded_utc": "2026-08-07T16:52:54+00:00",
+  "recorded_utc": "2026-08-08T08:37:36+00:00",
   "metrics": {
     "v_required": 535,
     "v_sent": 545,
@@ -35,6 +35,6 @@
     "VSAV_disp": 3,
     "FPT_disp": 0,
     "EPA_disp": 0,
-    "skill_lvl": 2821.0
+    "skill_lvl": 3447.0
   }
 }

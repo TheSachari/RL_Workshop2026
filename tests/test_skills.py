@@ -27,31 +27,29 @@ class TestGetRoleFromSkills:
         ff = np.array([[0, 0, 0]])  # lacks the required skill
         assert get_role_from_skills(required, ff).tolist() == [0]
 
-    def test_role_selection_is_inverted_by_an_argmin_argmax_slip(self):
-        """BUG, pinned: with several roles, the wrong one is selected.
+    def test_selects_the_first_compatible_role(self):
+        """Regression guard for the argmin/argmax slip.
 
-        The implementation reduces the (n_roles, n_ff) compatibility matrix with
-        `np.argmin`, which returns the first **incompatible** role. It should be
-        `np.argmax` (first compatible). Single-role vehicles and firefighters
-        matching every role are unaffected, which is why it survives.
-
-            firefighter fitting role 0 only -> reports 2 (should be 1)
-            firefighter fitting role 1 only -> reports 1 (should be 2)
-
-        This feeds gen_state via get_roles_for_ff, so it shapes the RL state on
-        every decision. Left as-is deliberately: fixing it changes the agent's
-        inputs and invalidates the recorded results, which is the author's call.
+        The reduction over the (n_roles, n_ff) compatibility matrix must be
+        `argmax` — the first **compatible** role. It used to be `argmin`, which
+        returns the first *incompatible* one, inverting the assignment whenever a
+        vehicle function had more than one role (95% of them in the project data,
+        and 31.8% of lookups gave a different answer).
         """
         required = np.array([[1, 0, 0], [0, 1, 0]])
 
         fits_role_zero = np.array([[1, 0, 0]])
-        assert get_role_from_skills(required, fits_role_zero).tolist() == [2]
+        assert get_role_from_skills(required, fits_role_zero).tolist() == [1]
 
         fits_role_one = np.array([[0, 1, 0]])
-        assert get_role_from_skills(required, fits_role_one).tolist() == [1]
+        assert get_role_from_skills(required, fits_role_one).tolist() == [2]
 
-    def test_single_role_vehicles_are_unaffected_by_that_slip(self):
-        """With one role, argmin and argmax agree — the common case still works."""
+    def test_picks_the_earliest_of_several_compatible_roles(self):
+        """A firefighter fitting every role takes the first one."""
+        required = np.array([[0, 0, 0], [0, 0, 0], [0, 0, 0]])
+        assert get_role_from_skills(required, np.array([[1, 1, 1]])).tolist() == [1]
+
+    def test_single_role_vehicles(self):
         required = np.array([[1, 0, 0]])
         assert get_role_from_skills(required, np.array([[1, 0, 0]])).tolist() == [1]
         assert get_role_from_skills(required, np.array([[0, 0, 0]])).tolist() == [0]

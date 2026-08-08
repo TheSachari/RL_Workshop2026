@@ -1061,7 +1061,7 @@ def get_role_from_skills(required_skills, ff_array):
     
     conditions_met = np.all(conditions_met, axis=2)
     
-    first_valid_index = np.argmin(conditions_met, axis=0) +1
+    first_valid_index = np.argmax(conditions_met, axis=0) +1
     
     first_valid_index[~np.any(conditions_met, axis=0)] = 0
     
