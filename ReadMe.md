@@ -4,6 +4,11 @@
 pip install -r requirements.txt
 ```
 
+The commands below are the reference for each script taken on its own. To run
+the whole chain — raw CSVs to a trained agent, in order, with the reasoning
+behind each parameter and the measured runtimes — see
+**[PIPELINE.md](PIPELINE.md)**.
+
 Scripts resolve their paths through `paths.py`, so they can be run from any
 directory. By default the data folders are expected next to the repo; point
 `RL_DATA_ROOT` elsewhere to keep the data outside it:
