@@ -89,13 +89,23 @@ def mean_flat(tensor):
     """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
-# def ohe_to_categories(ohe, K):
-#     K = torch.from_numpy(K)
-#     indices = torch.cat([torch.zeros((1,)), K.cumsum(dim=0)], dim=0).int().tolist()
-#     res = []
-#     for i in range(len(indices) - 1):
-#         res.append(ohe[:, indices[i]:indices[i+1]].argmax(dim=1))
-#     return torch.stack(res, dim=1)
+def ohe_to_categories(ohe, K):
+    """Collapse a concatenated one-hot encoding back to per-feature category indices.
+
+    `K` holds the class count of each categorical feature, so the columns of
+    `ohe` are the concatenation of that many one-hot blocks; the argmax within
+    each block is that feature's category.
+
+    Restored from a commented-out definition: `GaussianMultinomialDiffusion`
+    calls it on the `has_cat` path of both `sample` and `sample_ddim`, and
+    `from utils import *` hid the resulting NameError.
+    """
+    K = torch.from_numpy(K)
+    indices = torch.cat([torch.zeros((1,)), K.cumsum(dim=0)], dim=0).int().tolist()
+    res = []
+    for i in range(len(indices) - 1):
+        res.append(ohe[:, indices[i]:indices[i+1]].argmax(dim=1))
+    return torch.stack(res, dim=1)
 
 def log_1_min_a(a):
     return torch.log(1 - a.exp() + 1e-40)

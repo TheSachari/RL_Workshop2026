@@ -233,7 +233,9 @@ class Dueling_QNetwork(nn.Module):
 
         super(Dueling_QNetwork, self).__init__()
         self.seed = torch.manual_seed(seed)
+        self.state_size = state_size
         self.action_size = action_size
+        self.layer_size = layer_size
         self.num_layers = num_layers
         self.layer_type = layer_type
         self.use_batchnorm = use_batchnorm

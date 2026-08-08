@@ -8,7 +8,21 @@ import torch
 import math
 
 import numpy as np
-from utils import *
+from utils import (
+    FoundNANsError,
+    default,
+    discretized_gaussian_log_likelihood,
+    extract,
+    index_to_log_onehot,
+    log_1_min_a,
+    log_add_exp,
+    log_categorical,
+    mean_flat,
+    normal_kl,
+    ohe_to_categories,
+    sliced_logsumexp,
+    sum_except_batch,
+)
 
 """
 Based in part on: https://github.com/lucidrains/denoising-diffusion-pytorch/blob/5989f4c77eafcdc6be0fb4739f0f277a6dd7f7d8/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py#L281

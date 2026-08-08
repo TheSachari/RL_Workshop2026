@@ -32,23 +32,20 @@ Notes
   This refactor fixes that unpacking so the script can run.
 """
 
-import pandas as pd
+import argparse
+import json
+import pickle
+import random
+
 import numpy as np
-from agent_explainable import *
-from collective_functions import *
-from explainability import *
+import torch
+
+from agent_explainable import DQNAgent, FQFAgent, PPOAgent
+from collective_functions import DEFAULT_SEED, compute_reward, load_environment
+from explainability import get_dic_rare_skills, get_related_rows_in_time
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
 from simulator import run_simulation
-
-from datetime import datetime, timedelta
-import torch
-import json
-import argparse
-import re
-import ast
-import pickle
-from IPython.display import clear_output
 
 
 if __name__ == "__main__":
@@ -84,11 +81,13 @@ if __name__ == "__main__":
     hyper_params["max_train_steps"] = (args.end-args.start) * 5 # (approx. 5 actions by intervention)
     print("max_train_steps", hyper_params["max_train_steps"])
     if args.agent_model == "dqn":
-        agent = DQN_Agent(**hyper_params)
+        agent = DQNAgent(**hyper_params)
     elif args.agent_model == "fqf":
-        agent = FQF_Agent(**hyper_params)
+        agent = FQFAgent(**hyper_params)
     elif args.agent_model == "ppo":
-        agent = PPO_Agent(**hyper_params)
+        agent = PPOAgent(**hyper_params)
+    else:
+        raise ValueError(f"Unknown --agent_model: {args.agent_model!r}")
 
     model_path = resolve(args.model_name, SVG_MODEL)
 

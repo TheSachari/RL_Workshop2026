@@ -1,8 +1,11 @@
 import argparse
+from datetime import timedelta
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from collective_functions import *
+
+from collective_functions import update_skills
 from paths import DATA_ENVIRONMENT, DATA_SAMPLED, resolve
 tqdm.pandas()
 
