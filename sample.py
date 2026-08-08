@@ -74,12 +74,17 @@ def quantile_inverse_transform(df_res: pd.DataFrame, normalizer_ddpm) -> pd.Data
 
     Notes
     -----
-    The original code reloads `normalizer_ddpm.pkl` inside this function, ignoring the provided
-    argument. This refactor preserves that behavior to avoid changing results.
+    The original code reloads `normalizer_ddpm.pkl` inside this function,
+    ignoring the provided argument. That behaviour is preserved to avoid
+    changing results, but the path now resolves through `paths.py` instead of a
+    bare relative name: the original only worked because an `os.chdir` had
+    already moved into `Data_trained/`, so running it from anywhere else raised
+    FileNotFoundError.
     """
     cols = ["Coord X", "Coord Y", "Duration"]
     df_ddpm = pd.DataFrame(columns=cols)
-    normalizer_ddpm = pickle.load(open("normalizer_ddpm.pkl", "rb"))
+    with open(DATA_TRAINED / "normalizer_ddpm.pkl", "rb") as f:
+        normalizer_ddpm = pickle.load(f)
     df_ddpm[cols] = normalizer_ddpm.inverse_transform(df_res[cols].values)
     return df_ddpm
 
