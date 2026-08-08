@@ -19,6 +19,29 @@ from shapely import MultiPolygon, Point, unary_union
 from paths import DATA, DATA_PREPROCESSED, ensure_dirs, resolve
 
 
+def _clean_datetimes(parsed):
+    """Interpolate unparseable/pre-epoch timestamps, preserving the exact values.
+
+    The original spelling round-tripped the column through `np.float32` to get a
+    numeric series it could interpolate. That silently destroyed the data twice
+    over:
+
+    - float32 carries ~7 significant digits, but a 2018 timestamp is ~1.5e18 ns,
+      so start and end collapsed onto the same value and every duration became 0;
+    - pandas >= 2 parses to `datetime64[us]`, while `pd.to_datetime` reads a bare
+      number as *nanoseconds*, so converting back mapped 2018 onto 1970-01-18.
+      The code was written when parsing yielded `[ns]` and the round trip was at
+      least unit-consistent.
+
+    Casting to int64 nanoseconds instead is exact and unit-explicit, and supports
+    the same "negative means missing -> interpolate" repair the original intended.
+    """
+    ns = parsed.values.astype("datetime64[ns]").astype("int64")
+    s = pd.Series(ns, index=parsed.index, dtype="float64")
+    s[s < 0] = np.nan
+    return pd.to_datetime(s.interpolate().round().astype("int64"))
+
+
 def replace_vl_prefix(lst):
     return [re.sub(r"^VL\s+", "VL", item) for item in lst]
 
@@ -87,18 +110,12 @@ def preprocess(gdf_secteurs, df_sorties, df_inter, df_materiel):
     df_inter = df_inter.dropna(subset=(["coord_x", "coord_y"])).reset_index(drop=True)
 
     frmt = "%d/%m/%Y %H:%M:%S"
-    df_inter["heure_debut"] = df_inter["Date Heure Début Intervention"]
-    df_inter["heure_debut"] = pd.to_datetime(df_inter["heure_debut"], format=frmt)
-    s = pd.Series(df_inter["heure_debut"].values.astype(np.float32))
-    s[s < 0] = np.nan
-    df_inter["heure_debut"] = pd.to_datetime(s.interpolate())
-    df_inter["heure_debut"] = df_inter["heure_debut"].dt.floor("s")
-
-    df_inter["heure_fin"] = df_inter["Date Heure fin Intervention"]
-    df_inter["heure_fin"] = pd.to_datetime(df_inter["heure_fin"], format=frmt)
-    s = pd.Series(df_inter["heure_fin"].values.astype(np.float32))
-    s[s < 0] = np.nan
-    df_inter["heure_fin"] = pd.to_datetime(s.interpolate())
+    df_inter["heure_debut"] = _clean_datetimes(
+        pd.to_datetime(df_inter["Date Heure Début Intervention"], format=frmt)
+    ).dt.floor("s")
+    df_inter["heure_fin"] = _clean_datetimes(
+        pd.to_datetime(df_inter["Date Heure fin Intervention"], format=frmt)
+    )
 
     df_inter["duree"] = df_inter["heure_fin"] - df_inter["heure_debut"]
     df_inter["duree"] = df_inter["duree"].dt.total_seconds().div(60).astype(int)

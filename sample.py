@@ -143,10 +143,14 @@ def sincos_inverse_transform(df_sample: pd.DataFrame, df_res: pd.DataFrame, y_ge
         lambda row: decode_periodic(row["Hour_sin"], row["Hour_cos"], 24), axis=1
     )
     df_sample["Incident"] = y_gen + 1
+    # `duree` is this column's name in preprocess.py, not here — the lambda
+    # raised KeyError on the first out-of-range sample. The median is also taken
+    # over the in-range values once, up front: computing it inside the lambda
+    # re-derived it per row from a column being replaced as it went.
+    plausible = df_sample["Duration"].between(10, 20 * 60, inclusive="neither")
+    fallback = df_sample.loc[plausible, "Duration"].median()
     df_sample["Duration"] = (
-        df_sample["Duration"]
-        .apply(lambda x: x if x > 10 and x < 20 * 60 else df_sample["duree"].median())
-        .astype(int)
+        df_sample["Duration"].where(plausible, fallback).astype(int)
     )
     return df_sample
 
