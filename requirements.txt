@@ -7,3 +7,4 @@ scikit-learn
 shapely
 torch
 tqdm
+pytest

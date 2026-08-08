@@ -1,7 +1,13 @@
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A system ROS install ships pytest plugins that fail to import here
+# (launch_testing -> yaml). Autoloading them breaks collection, and the
+# project needs none of them.
+addopts = "-p no:cacheprovider"

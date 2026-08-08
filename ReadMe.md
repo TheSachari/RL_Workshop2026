@@ -16,11 +16,19 @@ Both simulation scripts take `--seed` (default 42), which fixes the vehicle and
 firefighter downsampling draws. The same seed always yields the same
 environment; vary it across replicates.
 
-Before and after changing anything, check that behaviour has not moved:
+Two levels of checking, both worth running before and after a change:
 
 ```bash
+# unit tests on the pure helpers — ~1s, no data needed
+python -m pytest
+
+# whole-run behaviour against recorded references — ~3min, needs the data
 python tools/golden/run_cases.py check --data-root "$RL_DATA_ROOT"
 ```
+
+If pytest fails during collection with `No module named 'yaml'`, a system ROS
+install is injecting its plugins; run `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m
+pytest` instead.
 
 See [tools/golden/README.md](tools/golden/README.md).
 
