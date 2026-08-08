@@ -464,6 +464,50 @@ def precompute_departure(df_sample: pd.DataFrame, dic_inc_ar_mat: dict) -> pd.Da
     return df_sample
 
 
+def is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+
+
+def add_leap_day(
+    df_sample: pd.DataFrame, start_year: int, seed: int = 42
+) -> pd.DataFrame:
+    """Give a leap year its 366th day, by replaying a nearby sampled day.
+
+    The generator draws each synthetic year from a model fitted on 2018, which
+    has 365 days, so `Day` never exceeds 365. Laid onto a leap year that leaves
+    the calendar a day short: 2020 and 2024 would run to 30 December and skip
+    the 31st, putting a one-day hole in an otherwise continuous stream.
+
+    Day 366 falls on 31 December, so the donor is drawn from the turn of the
+    year — late December or early January — rather than from the year at large.
+    Activity is strongly seasonal, roughly 162 interventions a day in December
+    against 202 in June and with a different incident mix, so replaying an
+    arbitrary day would land a summer profile on a winter date and distort both
+    the monthly totals and the incident distribution. Days on either side of
+    31 December share its volume, hour-of-day profile, incident types and
+    spatial spread, and 1 January is as close a neighbour as 30 December.
+
+    The cost is that day 366 is not an independent draw. That is deliberate: one
+    replayed day in 366 is a smaller distortion than a missing day, and doing it
+    here rather than inside `precompute_date` keeps it visible.
+    """
+    if not is_leap_year(start_year):
+        return df_sample
+
+    # `Day` is still day-of-year here: 335+ is December, 1-15 is early January.
+    # Both flank 31 December, so either is a plausible stand-in for it.
+    window = df_sample["Day"].between(335, 365) | df_sample["Day"].between(1, 15)
+    candidates = df_sample.loc[window, "Day"].unique()
+    if not len(candidates):  # neither end present: fall back to the whole year
+        candidates = df_sample["Day"].unique()
+
+    donor_day = np.random.default_rng(seed + start_year).choice(np.sort(candidates))
+    leap_day = df_sample[df_sample["Day"] == donor_day].copy()
+    leap_day["Day"] = 366
+
+    return pd.concat([df_sample, leap_day], ignore_index=True)
+
+
 def precompute_date(df_sample: pd.DataFrame, start_year: int, seed: int = 42) -> pd.DataFrame:
     """
     Build an absolute datetime from Day/Hour/Minute and overwrite Month/Day/Hour/Minute from it.
@@ -749,13 +793,19 @@ def main() -> None:
     for sample_file in args.sample_list or []:
         start_inter += window
         sample_path = resolve(sample_file, DATA_SAMPLED)
-        window = len(pd.read_pickle(sample_path))
+
+        df_pc_fake = pd.read_pickle(sample_path)
+        # A leap year needs its 366th day before the interventions are counted:
+        # `window` sizes the num_inter range assigned in precompute_returns, so
+        # adding rows after this point would leave the numbering short.
+        df_pc_fake = add_leap_day(df_pc_fake, start_year)
+
+        window = len(df_pc_fake)
         print("window fake:", window)
         end_inter += window
 
         print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
 
-        df_pc_fake = pd.read_pickle(sample_path)
         df_pc_fake = precompute_pdd(df_pdd, df_pc_fake, stations_u)
         df_pc_fake = precompute_zone(df_stations, df_pc_fake, Z_1, Z_2, Z_3)
         df_pc_fake = precompute_incident(df_rank_incident, df_pc_fake)
