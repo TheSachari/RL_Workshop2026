@@ -26,14 +26,42 @@ They now call `run_simulation` with different callbacks:
 Everything else — resource lookup, reinforcement logistics, role assignment — is
 run once, from one place, for both.
 
-The body below is the original loop, lifted verbatim apart from the decision
-call. It is long and mutates its locals throughout; that is deliberate at this
-stage. Grouping the rest of the state is a separate step, and doing it in the
-same commit as the merge would have made the golden diff impossible to read.
+## Structure
+
+The loop body used to be one 470-line `for` statement nested up to eighteen
+blocks deep, because every level of the dispatch problem was expressed inline:
+per event, per station, per required vehicle, per candidate function, per role.
+The nesting was not incidental — it is what hid three `UnboundLocalError`s
+(`stations_VSAV/FPT/EPA`, read ~200 lines above the only branch that assigns
+them) behind a wall of indentation where no reader was going to find them.
+
+It is now split along the seams the loop already had, outermost to innermost:
+
+    run_simulation          per event row: arrivals, then RETURN or intervention
+      _handle_intervention  per intervention: walks the stations
+        _fill_station       per station: walks the vehicles still required
+          _find_vehicle     per required vehicle: finds a machine with the function
+            _fill_roles     per vehicle found: assigns crew, one role at a time
+
+Each helper takes and returns a `_LoopState`, which holds exactly the locals the
+original body mutated in place, under the same names. That is what keeps the
+translation honest: the helpers are the original blocks, moved, not rewritten.
+
+The three reinforceable vehicle types (VSAV, FPT, EPA) had their arrival,
+dispatch, return and availability logic written out three times each — twelve
+blocks that a token-level diff shows to be identical apart from the type name,
+the `dic_indic` key, and one threshold (EPA uses 1 where the others use 2). They
+are now loops over `VEHICLE_TYPES`, with the threshold carried as data in
+`_REINFORCEMENT_THRESHOLD`. `fleet[v_type]` and `ReinforcementState.num_d`
+already existed in `sim_state.py` for this.
+
+Behaviour is unchanged, deliberately: same order of operations, same mutations,
+same metrics. The one intended difference is the `stations_*` fix described in
+`_LoopState`.
 """
 
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, Optional
 
 from collective_functions import (
     adding_lent_ff,
@@ -42,7 +70,6 @@ from collective_functions import (
     gen_state,
     get_mandatory_max,
     get_neighborhood_availability,
-    get_potential_actions,
     get_potential_veh,
     reinforcement_arriving,
     reinforcement_returning,
@@ -56,6 +83,26 @@ from collective_functions import (
     v_to_return_managing,
     veh_management,
 )
+from sim_state import VEHICLE_TYPES
+
+# `veh_management`'s `threshold` argument. EPA keeps fewer in reserve than the
+# other two; this was the only real difference between the three copies of the
+# reinforcement-availability block.
+_REINFORCEMENT_THRESHOLD = {"VSAV": 2, "FPT": 2, "EPA": 1}
+
+# Departures numbered at or above this are reinforcement movements rather than
+# vehicles belonging to the intervention's own train (99/100/101 per type; see
+# `sim_state.SENTINEL`).
+_REINFORCEMENT_NUM_D = 99
+
+# Longest initial train dispatched in one pass; anything beyond spills into a
+# follow-up departure.
+_MAX_TRAIN = 5
+
+
+def _slot(st):
+    """The planning slot for the station and hour currently being served."""
+    return st.planning[st.current_station][st.month][st.day][st.hour]
 
 
 @dataclass
@@ -70,6 +117,544 @@ class ActionContext:
     dic_indic: dict
     dic_indic_old: dict
     potential_actions: list
+
+
+@dataclass
+class _LoopState:
+    """The locals the original loop body mutated in place, under one name.
+
+    Passing this between the extracted helpers is what lets them be the original
+    blocks rather than rewrites of them: a helper reads and assigns the same
+    fields the inline code did, in the same order.
+
+    `stations` holds the per-type station iterators consulted when a
+    reinforcement sentinel comes up. In the original these were three bare
+    locals (`stations_VSAV`, `stations_FPT`, `stations_EPA`) assigned only
+    inside the `current_station in Z_1` branch but read from the top of the
+    departure loop, so an event that hit a sentinel before any reinforcement had
+    been arranged raised `UnboundLocalError` — ruff flagged all three as F821.
+    Starting them as empty iterators preserves the intended reading (no
+    candidate stations yet, so `next(..., False)` yields False and the departure
+    is treated as unfulfillable) without the crash.
+    """
+
+    # --- environment handles (mutated in place) ---
+    dic_vehicles: dict
+    dic_functions: dict
+    df_skills: Any
+    dic_roles_skills: dict
+    dic_roles: dict
+    planning: dict
+    dic_inter: dict
+    dic_ff: dict
+    dic_indic: dict
+    dic_indic_old: dict
+    Z_1: Any
+    Z_4: Any
+    dic_lent: dict
+    dic_station_distance: dict
+    df_pc: Any
+    skills_updated: Any
+    max_duration: Any
+
+    # --- per-run bookkeeping ---
+    fleet: Any
+    action_size: int
+    decide: Callable
+    on_action: Optional[Callable[[ActionContext], None]] = None
+
+    vehicle_out: int = 0
+    action_num: int = 0
+    num_d: int = 42
+    all_ff_waiting: bool = False
+    v_waiting: bool = False
+    following_depart: bool = False
+
+    vehicle_evo: list = field(default_factory=list)
+    current_ff_inter: list = field(default_factory=list)
+    dic_log: dict = field(default_factory=dict)
+    dic_back: dict = field(default_factory=dict)
+    dic_start_time: dict = field(default_factory=dict)
+    dic_veh_typ: dict = field(default_factory=dict)
+
+    # Per-type station iterators; see the class docstring for why these are
+    # seeded rather than left unbound.
+    stations: dict = field(
+        default_factory=lambda: {v: iter(()) for v in VEHICLE_TYPES}
+    )
+
+    # --- per-event row fields, refreshed by `_unpack_row` ---
+    idx: Any = None
+    num_inter: Any = None
+    date: Any = None
+    duration: Any = None
+    month: Any = None
+    day: Any = None
+    hour: Any = None
+    coord_x: Any = None
+    coord_y: Any = None
+    month_sin: Any = None
+    month_cos: Any = None
+    day_sin: Any = None
+    day_cos: Any = None
+    hour_sin: Any = None
+    hour_cos: Any = None
+
+    # --- per-intervention scratch, reset by `_handle_intervention` ---
+    pdd: Any = None
+    required_departure: dict = field(default_factory=dict)
+    new_required_departure: dict = field(default_factory=dict)
+    veh_depart: list = field(default_factory=list)
+    new_veh_depart: list = field(default_factory=list)
+    station_iter: Optional[Iterator] = None
+    inter_done: bool = False
+    departure_done: bool = False
+    station_lvl: int = 0
+    idx_role: int = 0
+    v_mat_to_return: int = 0
+    current_station: Any = None
+    required_vehicles: Optional[Iterator] = None
+    list_v: list = field(default_factory=list)
+    mandatory: Any = None
+    team_max: Any = None
+    v_mat: Any = None
+    vehicle_to_find: Any = None
+    vehicle_found: bool = False
+    degraded: bool = False
+
+
+def _unpack_row(st: _LoopState, row) -> None:
+    """Copy one event row's fields onto the loop state.
+
+    The agent's event stream carries a 20th column (rare skills required); the
+    baseline's does not. Take the common prefix either way.
+    """
+    (
+        st.idx, st.num_inter, st.date, pdd, required_departure, _zone, st.duration,
+        st.month, st.day, st.hour, _minute, st.coord_x, st.coord_y,
+        st.month_sin, st.month_cos, st.day_sin, st.day_cos, st.hour_sin, st.hour_cos,
+    ) = row[:19]
+    st.pdd = pdd
+    st.required_departure = required_departure
+
+
+def _handle_arrivals(st: _LoopState) -> None:
+    """Land any reinforcement whose arrival event is this intervention."""
+    for v_type in VEHICLE_TYPES:
+        r = st.fleet[v_type]
+        if not (r.sent and st.num_inter == r.arrival_num):
+            continue
+
+        (
+            st.dic_vehicles, r.sent, r.lent, r.returning,
+            st.dic_ff, st.planning, st.dic_back, st.dic_lent, st.dic_log,
+            r.to_return,
+        ) = reinforcement_arriving(
+            st.num_inter, st.dic_vehicles, st.dic_back, st.dic_lent,
+            st.dic_ff, st.dic_log, st.planning, r.from_station, r.to_station,
+            r.sent, r.returning, r.lent, r.to_return,
+            st.month, st.day, st.hour, st.dic_start_time, v_type,
+        )
+
+
+def _split_train(st: _LoopState) -> None:
+    """Cap the departure at `_MAX_TRAIN`, spilling the rest into a follow-up."""
+    if len(st.veh_depart) > _MAX_TRAIN:
+        st.new_veh_depart = st.veh_depart[_MAX_TRAIN:].copy()
+        st.veh_depart = st.veh_depart[:_MAX_TRAIN]
+        st.required_departure = {i + 1: [v] for i, v in enumerate(st.veh_depart)}
+        st.following_depart = True
+
+
+def _manage_reinforcements(st: _LoopState) -> None:
+    """Reassess reinforcement needs after a vehicle left a Z_1 station.
+
+    Only the first type with no reinforcement already in flight is considered,
+    which is what the original `if not VSAV.sent / elif not FPT.sent / elif not
+    EPA.sent` chain expressed.
+    """
+    for v_type in VEHICLE_TYPES:
+        r = st.fleet[v_type]
+        if r.sent:
+            continue
+
+        r.disp, r.to_station = get_potential_veh(
+            st.Z_1, st.dic_vehicles, st.dic_functions, v_type
+        )
+
+        (
+            st.stations[v_type], r.needed, r.to_return, st.new_required_departure,
+            r.to_station, st.dic_ff, st.v_mat_to_return,
+        ) = veh_management(
+            r.disp, r.needed, r.to_return, r.lent, r.to_station,
+            st.new_required_departure, st.dic_station_distance, st.num_inter,
+            st.dic_lent, st.dic_vehicles, st.dic_functions, st.dic_ff,
+            _REINFORCEMENT_THRESHOLD[v_type], v_type, r.num_d,
+        )
+
+        st.dic_indic[f"{v_type}_needed"] += int(r.needed)
+        st.dic_indic[f"{v_type}_disp"] = int(r.disp)
+        return
+
+
+def _send_reinforcement(st: _LoopState, ff_to_send: list) -> bool:
+    """Dispatch this vehicle as a reinforcement, if that is what it is."""
+    for v_type in VEHICLE_TYPES:
+        r = st.fleet[v_type]
+        if not (r.needed and st.num_d == r.num_d):
+            continue
+
+        st.dic_start_time[st.v_mat] = (st.month, st.day, st.hour)
+        (
+            r.from_station, st.dic_vehicles, r.arrival_num, st.dic_lent,
+            st.dic_log, st.new_required_departure, r.needed, r.sent,
+        ) = reinforcement_sending(
+            st.num_inter, st.current_station, r.from_station, st.v_mat,
+            st.dic_vehicles, st.dic_station_distance, r.to_station, st.date,
+            st.df_pc, st.idx, st.dic_lent, ff_to_send, st.dic_log, r.needed,
+            r.sent, st.required_departure, st.new_required_departure,
+            st.num_d, v_type,
+        )
+        st.dic_indic[f"z1_{v_type}_sent"] += 1
+        return True
+    return False
+
+
+def _return_reinforcement(st: _LoopState, ff_to_send: list) -> None:
+    """Send a borrowed vehicle home, or release it if its crew is unavailable."""
+    if st.all_ff_waiting:
+        for v_type in VEHICLE_TYPES:
+            r = st.fleet[v_type]
+            if not (r.to_return and st.num_d == r.num_d):
+                continue
+
+            (
+                r.from_station, r.to_station, r.arrival_num, st.dic_back,
+                st.dic_log, r.needed, r.sent, st.all_ff_waiting, st.v_waiting,
+                r.to_return, r.returning,
+            ) = reinforcement_returning(
+                st.num_inter, r.to_station, r.from_station, st.dic_log,
+                st.v_mat, st.dic_vehicles, st.dic_station_distance, st.date,
+                st.df_pc, st.idx, st.dic_back, ff_to_send, r.needed, r.sent,
+                st.all_ff_waiting, st.v_waiting, r.returning, v_type,
+            )
+            return
+    else:
+        # Return impossible, firefighters unavailable: make it available again.
+        st.v_waiting = False
+        st.dic_vehicles[st.current_station]["available"].append(st.v_mat)
+        _slot(st)["available"] += ff_to_send
+
+
+def _depart_on_intervention(st: _LoopState, ff_to_send: list) -> None:
+    """Commit the vehicle and its crew to the intervention, and update metrics."""
+    st.dic_inter[st.num_inter][st.current_station][st.v_mat] = ff_to_send
+    st.dic_vehicles[st.current_station]["inter"].append(st.v_mat)
+
+    st.current_ff_inter += ff_to_send
+    for f in ff_to_send:
+        st.dic_ff[f] = st.duration
+
+    st.vehicle_out += 1
+
+    st.dic_indic["v_sent"] += 1
+    if st.degraded:
+        st.dic_indic["v_degraded"] += 1
+    else:
+        st.dic_indic["v_sent_full"] += 1
+    st.dic_indic["ff_sent"] += len(ff_to_send)
+
+    st.dic_veh_typ = update_dict(st.dic_veh_typ, st.vehicle_to_find)
+
+    if st.current_station in st.Z_1:
+        _manage_reinforcements(st)
+
+
+def _resolve_crew(st: _LoopState) -> list:
+    """Work out which firefighters are available to crew `st.v_mat`.
+
+    When a borrowed vehicle is waiting to go home, its own lent crew is the
+    candidate pool and `all_ff_waiting` records whether they are all free;
+    otherwise the pool is the station's planned crew minus anyone lent out or
+    already committed.
+    """
+    ff_mats = _slot(st)["planned"].copy()
+    ff_existing = adding_lent_ff(
+        st.fleet.VSAV.lent, st.fleet.FPT.lent, st.fleet.EPA.lent,
+        st.current_station, st.Z_1, st.dic_lent, ff_mats, st.dic_ff,
+    )
+
+    if not st.v_waiting:
+        lent_ff = [
+            ff
+            for v_m in st.dic_lent.values()
+            for ff_lent in v_m.values()
+            for ff in ff_lent
+        ]
+        ff_not_lent = [num for num in ff_existing if num not in lent_ff]
+        return [f for f in ff_not_lent if st.dic_ff[f] > -1].copy()
+
+    st.v_mat = st.v_mat_to_return
+
+    # Checked in fleet order, and each type clears its predecessor's flag once
+    # it takes over the return — the original wrote this as three guarded ifs.
+    previous = None
+    for v_type in VEHICLE_TYPES:
+        r = st.fleet[v_type]
+        if st.all_ff_waiting:
+            break
+        if r.to_return and st.current_station == r.to_station and \
+                v_type in st.dic_functions[st.v_mat]:
+            st.all_ff_waiting = are_all_ff_waiting(
+                ff_existing, st.current_station, st.dic_lent, st.dic_ff, st.v_mat
+            )
+            if previous is not None:
+                st.fleet[previous].to_return = False
+        previous = v_type
+
+    if st.all_ff_waiting:
+        return st.dic_lent[st.current_station][st.v_mat]
+
+    st.fleet.EPA.to_return = False
+    return [f for f in ff_existing if st.dic_ff[f] > -1].copy()
+
+
+def _fill_roles(st: _LoopState) -> None:
+    """Assign crew to `st.v_mat`, one role at a time, until the vehicle leaves.
+
+    Each pass either fills one role (delegating the choice to `decide`) or, when
+    no role is left, releases the vehicle — as a reinforcement being sent, a
+    reinforcement going home, or a departure on the intervention.
+    """
+    roles = st.dic_roles[st.vehicle_to_find]
+    role_number = iter(range(1, len(roles) + 1))
+    all_roles_found = False
+    st.degraded = False
+
+    while not all_roles_found:
+
+        num_role = next(role_number, 0)
+        if num_role > st.team_max:  # Pour limiter les rôles
+            num_role = 0
+
+        if not num_role:  # S'il n'y a plus de rôles à pourvoir
+            all_roles_found = True
+            ff_to_send = _slot(st)["standby"].copy()
+            _slot(st)["standby"] = []
+            st.dic_vehicles[st.current_station]["standby"].remove(st.v_mat)
+
+            if _send_reinforcement(st, ff_to_send):
+                continue
+            if st.v_waiting:
+                _return_reinforcement(st, ff_to_send)
+            else:
+                _depart_on_intervention(st, ff_to_send)
+            continue
+
+        # S'il y a un rôle à pourvoir
+        info_avail = get_neighborhood_availability(
+            st.pdd, st.current_station, st.num_d, st.dic_vehicles,
+            st.planning, st.month, st.day, st.hour, 5,
+        )
+
+        ff_existing = _resolve_crew(st)
+        ff_array = gen_ff_array(st.df_skills, st.skills_updated, ff_existing)
+
+        state = gen_state(
+            st.veh_depart, st.idx_role, ff_array, ff_existing,
+            st.dic_roles, st.dic_roles_skills, st.dic_ff, st.df_skills,
+            st.coord_x, st.coord_y, st.month_sin, st.month_cos, st.day_sin,
+            st.day_cos, st.hour_sin, st.hour_cos, info_avail,
+            st.max_duration, st.action_size,
+        )
+
+        action, skill_lvl, potential_actions = st.decide(
+            state, st.all_ff_waiting, ff_array, st.inter_done
+        )
+
+        (
+            st.dic_indic, st.dic_lent, all_roles_found, st.vehicle_found,
+            st.planning, st.dic_vehicles, st.dic_ff, st.idx_role, st.degraded,
+        ) = step(
+            action, st.idx_role, ff_existing, st.all_ff_waiting, st.current_station,
+            st.Z_1, st.dic_lent, st.v_mat, st.dic_ff, st.fleet.VSAV.lent,
+            st.fleet.FPT.lent, st.fleet.EPA.lent, st.planning, st.month, st.day,
+            st.hour, st.num_inter, st.new_required_departure, st.num_d, st.list_v,
+            num_role, st.mandatory, st.degraded, st.team_max, all_roles_found,
+            st.vehicle_found, st.dic_vehicles, st.dic_indic, skill_lvl, st.station_lvl,
+        )
+
+        # Before dic_indic_old is refreshed: the reward is the delta between the
+        # two, so the agent must read it here.
+        if st.on_action is not None:
+            st.on_action(ActionContext(
+                state=state, action=action, skill_lvl=skill_lvl,
+                num_d=st.num_d, inter_done=st.inter_done,
+                dic_indic=st.dic_indic, dic_indic_old=st.dic_indic_old,
+                potential_actions=potential_actions,
+            ))
+
+        st.dic_indic_old = st.dic_indic.copy()
+        st.action_num += 1  # for metrics
+
+
+def _find_vehicle(st: _LoopState) -> None:
+    """Find a machine at `st.current_station` providing one required function.
+
+    Walks the functions this departure will accept. The first one the station
+    can serve wins and goes on to crewing; if none can be served, the departure
+    is deferred to the next station via `new_required_departure`.
+    """
+    if st.num_d >= _REINFORCEMENT_NUM_D:
+        for v_type in VEHICLE_TYPES:
+            if st.num_d == st.fleet[v_type].num_d:
+                st.current_station = next(st.stations[v_type], False)
+                break
+
+    vehicles_to_find = iter(st.list_v)
+    st.vehicle_found = False
+
+    if not st.current_station:
+        st.vehicle_found = True
+        st.all_ff_waiting = False
+
+    while not st.vehicle_found:
+
+        st.vehicle_to_find = next(vehicles_to_find, False)
+
+        if not st.vehicle_to_find:  # S'il n'y a plus de fonction à faire partir
+            st.idx_role += st.team_max
+            st.vehicle_found = True
+            st.new_required_departure[st.num_d] = st.list_v
+            st.dic_indic["function_not_found"] += 1
+            continue
+
+        # On cherche les véhicules disponibles dans la caserne actuelle
+        # correspondant à la fonction requise.
+        v_mats = st.dic_vehicles[st.current_station]["available"].copy()
+        li_mat_veh = [
+            v_m for v_m in v_mats if st.vehicle_to_find in st.dic_functions[v_m]
+        ]
+
+        if not li_mat_veh:  # si aucun véhicule n'a la fonction requise
+            continue
+
+        st.v_mat = li_mat_veh[0]
+        for v_type in VEHICLE_TYPES:
+            r = st.fleet[v_type]
+            if r.to_return and st.current_station == r.to_station \
+                    and st.num_d == r.num_d:
+                st.v_mat, st.v_waiting = v_to_return_managing(
+                    st.dic_log, li_mat_veh, st.v_waiting, st.vehicle_to_find,
+                    st.current_station, st.dic_vehicles, v_type, st.v_mat_to_return,
+                )
+                break
+
+        if st.num_d < _REINFORCEMENT_NUM_D:
+            st.veh_depart[st.num_d - 1] = st.vehicle_to_find
+
+        st.mandatory, st.team_max = get_mandatory_max(st.vehicle_to_find)
+
+        # On met le véhicule en standby
+        st.dic_vehicles[st.current_station]["available"].remove(st.v_mat)
+        st.dic_vehicles[st.current_station]["standby"].append(st.v_mat)
+        st.vehicle_found = True
+
+        _fill_roles(st)
+
+
+def _advance_train(st: _LoopState) -> None:
+    """No vehicle left to place from this station: move to the next train.
+
+    Promotes the deferred departures to the active train, or ends the
+    intervention — unless a follow-up train is pending, which restarts the
+    station walk from the top.
+    """
+    st.departure_done = True
+
+    if st.new_required_departure:
+        st.required_departure = update_dep(st.new_required_departure)
+        st.veh_depart = [v[0] for k, v in sorted(st.required_departure.items())]
+        st.new_required_departure = {}
+        st.idx_role = 0
+        return
+
+    st.inter_done = True
+    if not st.following_depart:
+        return
+
+    # A follow-up departure is pending: restart from the nearest station.
+    st.inter_done = False
+    st.station_iter = iter(st.pdd)
+    st.station_lvl = 0
+    st.veh_depart = st.new_veh_depart
+    st.required_departure = update_dep(
+        {i + 1: [v] for i, v in enumerate(st.new_veh_depart)}
+    )
+    _split_train(st)
+    st.new_required_departure = {}
+    st.idx_role, st.num_d = 0, 1
+    st.following_depart = False
+
+
+def _fill_station(st: _LoopState) -> None:
+    """Place as many of the still-required vehicles as this station can supply."""
+    while not st.departure_done:
+
+        # On cherche les véhicules requis dans le train initial.
+        st.num_d, st.list_v = next(st.required_vehicles, (0, []))
+
+        if st.station_lvl == 2 and st.num_d == 1:
+            st.dic_indic["v1_not_sent_from_s1"] += 1
+        if st.station_lvl > 3 and st.num_d <= 3 and st.current_station in st.Z_4:
+            st.dic_indic["v3_not_sent_from_s3"] += 1
+
+        if not st.list_v:
+            _advance_train(st)
+            continue
+
+        st.mandatory, st.team_max = get_mandatory_max(st.list_v[0])
+        _find_vehicle(st)
+
+
+def _handle_intervention(st: _LoopState) -> None:
+    """Dispatch one intervention, walking outward through the nearest stations."""
+    st.veh_depart = [v[0] for k, v in sorted(st.required_departure.items())]
+    st.dic_indic["v_required"] += len(st.required_departure)
+    _split_train(st)
+
+    st.new_required_departure = {}
+    st.station_iter = iter(st.pdd)
+    st.inter_done = False
+    for v_type in VEHICLE_TYPES:
+        st.fleet[v_type].to_return = False
+    st.station_lvl = 0
+    st.idx_role = 0
+    st.v_mat_to_return = 0
+
+    st.vehicle_evo.append([st.num_inter, st.vehicle_out])
+
+    while not st.inter_done:  # Tant que l'intervention n'est pas finie
+
+        # On va dans la plus proche caserne.
+        st.current_station = next(st.station_iter, False)
+        if st.num_d < _REINFORCEMENT_NUM_D \
+                and st.current_station not in st.dic_inter[st.num_inter]:
+            # Il s'agit d'une intervention et non d'un renfort.
+            st.dic_inter[st.num_inter][st.current_station] = {}
+
+        st.station_lvl += 1
+
+        if not st.current_station:
+            # Plus de caserne à visiter: l'intervention est terminée.
+            st.inter_done = True
+            st.departure_done = True
+            st.dic_indic["v_not_found_in_last_station"] += len(st.required_departure)
+        else:
+            st.departure_done = False
+            st.required_vehicles = iter(sorted(st.required_departure.items()))
+
+        _fill_station(st)
 
 
 def run_simulation(
@@ -93,505 +678,78 @@ def run_simulation(
     runner uses it to precompute upcoming rare skills). `on_interval(num_inter)`
     runs on the loop's periodic logging tick.
     """
-    # Unpack the environment into the local names the loop body uses.
-    dic_vehicles = env.dic_vehicles
-    dic_functions = env.dic_functions
-    df_skills = env.df_skills
-    dic_roles_skills = env.dic_roles_skills
-    dic_roles = env.dic_roles
-    planning = env.planning
-    dic_inter = env.dic_inter
-    dic_ff = env.dic_ff
-    dic_indic = env.dic_indic
-    dic_indic_old = env.dic_indic_old
-    Z_1 = env.Z_1
-    Z_4 = env.Z_4
-    dic_lent = env.dic_lent
-    dic_station_distance = env.dic_station_distance
-    df_pc = env.df_pc
+    st = _LoopState(
+        dic_vehicles=env.dic_vehicles,
+        dic_functions=env.dic_functions,
+        df_skills=env.df_skills,
+        dic_roles_skills=env.dic_roles_skills,
+        dic_roles=env.dic_roles,
+        planning=env.planning,
+        dic_inter=env.dic_inter,
+        dic_ff=env.dic_ff,
+        dic_indic=env.dic_indic,
+        dic_indic_old=env.dic_indic_old,
+        Z_1=env.Z_1,
+        Z_4=env.Z_4,
+        dic_lent=env.dic_lent,
+        dic_station_distance=env.dic_station_distance,
+        df_pc=env.df_pc,
+        skills_updated=env.skills_updated,
+        max_duration=env.df_pc["Duration"].max(),
+        fleet=fleet,
+        action_size=action_size,
+        decide=decide,
+        on_action=on_action,
+    )
+
     old_date = env.old_date
     date_reference = env.date_reference
-    skills_updated = env.skills_updated
 
-    vehicle_out, num_d, action_num = 0, 42, 0
-    all_ff_waiting, v_waiting, following_depart = (False,) * 3
+    for row in st.df_pc.itertuples(index=True, name=None):
 
-    vehicle_evo, current_ff_inter = [], []
-    dic_log, dic_back, dic_start_time, dic_veh_typ = {}, {}, {}, {}
-
-    max_duration = df_pc["Duration"].max()
-
-    for row in df_pc.itertuples(index=True, name=None):
-
-        # The agent's event stream carries a 20th column (rare skills required);
-        # the baseline's does not. Take the common prefix either way.
-        idx, num_inter, date, pdd, required_departure, zone, duration, month, day, hour, minute, \
-        coord_x, coord_y, month_sin, month_cos, day_sin, day_cos, hour_sin, hour_cos = row[:19]
+        _unpack_row(st, row)
 
         if on_row is not None:
-            on_row(idx, date, pdd, df_pc)
+            on_row(st.idx, st.date, st.pdd, st.df_pc)
 
-        dic_ff = update_duration(date, old_date, current_ff_inter, dic_ff)
+        st.dic_ff = update_duration(st.date, old_date, st.current_ff_inter, st.dic_ff)
 
-        if date >= date_reference:
-            date_reference = date
-            skills_updated = update_skills(df_skills, date_reference)
-                
-        if (fleet.VSAV.sent) and (num_inter == fleet.VSAV.arrival_num) :  # ARRIVEE DES RENFORTS VSAV
-            dic_vehicles, fleet.VSAV.sent, fleet.VSAV.lent, fleet.VSAV.returning, \
-            dic_ff, planning, dic_back, dic_lent, dic_log, \
-            fleet.VSAV.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, fleet.VSAV.from_station, fleet.VSAV.to_station, fleet.VSAV.sent, \
-                                                    fleet.VSAV.returning, fleet.VSAV.lent, fleet.VSAV.to_return, month, day, hour, dic_start_time, "VSAV")
+        if st.date >= date_reference:
+            date_reference = st.date
+            st.skills_updated = update_skills(st.df_skills, date_reference)
 
-        if (fleet.FPT.sent) and (num_inter == fleet.FPT.arrival_num) :  # ARRIVEE DES RENFORTS FPT
-            dic_vehicles, fleet.FPT.sent, fleet.FPT.lent, fleet.FPT.returning, \
-            dic_ff, planning, dic_back, dic_lent, dic_log, \
-            fleet.FPT.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, fleet.FPT.from_station, fleet.FPT.to_station, fleet.FPT.sent, \
-                                                    fleet.FPT.returning, fleet.FPT.lent, fleet.FPT.to_return, month, day, hour, dic_start_time, "FPT")
+        _handle_arrivals(st)
 
-        if (fleet.EPA.sent) and (num_inter == fleet.EPA.arrival_num) :  # ARRIVEE DES RENFORTS EPA
-            dic_vehicles, fleet.EPA.sent, fleet.EPA.lent, fleet.EPA.returning, \
-            dic_ff, planning, dic_back, dic_lent, dic_log, \
-            fleet.EPA.to_return = reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, \
-                                                    dic_ff, dic_log, planning, fleet.EPA.from_station, fleet.EPA.to_station, fleet.EPA.sent, \
-                                                    fleet.EPA.returning, fleet.EPA.lent, fleet.EPA.to_return, month, day, hour, dic_start_time, "EPA")
-    
-        if (required_departure == {0:"RETURN"}):  # RETOUR D'INTERVENTION    
-            vehicle_out, dic_vehicles, dic_ff, current_ff_inter, planning, \
-            dic_inter = returning(df_pc, dic_inter, num_inter, vehicle_out, dic_vehicles, \
-                                  dic_ff, current_ff_inter, planning, month, day, hour)
-                     
-        else: # INTERVENTION      
-            veh_depart = [v[0] for k, v in sorted(required_departure.items())]
+        if st.required_departure == {0: "RETURN"}:  # RETOUR D'INTERVENTION
+            (
+                st.vehicle_out, st.dic_vehicles, st.dic_ff, st.current_ff_inter,
+                st.planning, st.dic_inter,
+            ) = returning(
+                st.df_pc, st.dic_inter, st.num_inter, st.vehicle_out,
+                st.dic_vehicles, st.dic_ff, st.current_ff_inter, st.planning,
+                st.month, st.day, st.hour,
+            )
+        else:
+            _handle_intervention(st)
 
-            dic_indic['v_required'] += len(required_departure)
-
-            if len(veh_depart) > 5:
-                new_veh_depart = veh_depart[5:].copy()
-                veh_depart = veh_depart[:5]  
-                required_departure = {i + 1: [v] for i, v in enumerate(veh_depart)}
-                following_depart = True
-                # print("following_depart", veh_depart)
-
-            new_required_departure = {}
-            stations = iter(pdd)            
-            inter_done = False
-            fleet.VSAV.to_return, fleet.FPT.to_return, fleet.EPA.to_return = (False,) * 3
-            station_lvl = 0
-            idx_role = 0
-            v_mat_to_return = 0
-            
-            vehicle_evo.append([num_inter, vehicle_out])
-    
-            while not inter_done: # Tant que l'intervention n'est pas finie   
-                
-                current_station = next(stations, False) # On va dans la plus proche caserne
-                if (num_d < 99) and (current_station not in dic_inter[num_inter]):
-                    # Il s'agit d'une intervention et non d'un renfort
-                    dic_inter[num_inter][current_station] = {}
-                    
-                station_lvl += 1
-    
-                if not current_station: # S'il n'y a plus de plus proche caserne, l'intervention est terminée
-                    inter_done = True
-                    departure_done = True         
-                    dic_indic['v_not_found_in_last_station'] += len(required_departure)
-                    # print("v_not_found_in_last_station")
-    
-                else: # Sinon on cherche les véhicules requis
-                    departure_done = False
-                    required_vehicles = iter(sorted(required_departure.items()))
-
-                # print(num_inter, veh_depart)
-        
-                while not departure_done: # Tant que tous les véhicules n'ont pas été envoyés
-                    
-                    num_d, list_v = next(required_vehicles, (0, [])) # On cherche les véhicules requis dans le train initial
-                    # print("start", "num_d", num_d, "list_v", list_v)
-                    if station_lvl == 2 and num_d == 1:
-                        dic_indic['v1_not_sent_from_s1'] += 1
-                        # print("v1_not_sent_from_1st_station", station_lvl)
-                    if station_lvl > 3 and num_d <= 3 and current_station in Z_4:
-                        dic_indic['v3_not_sent_from_s3'] += 1
-                    
-                    if list_v:
-                        mandatory, team_max = get_mandatory_max(list_v[0])
-                    
-                    if not list_v: # S'il n'y a plus de véhicules requis dans le train initial    
-                        departure_done = True # On a envoyés tous les véhicules possibles depuis cette caserne 
-                        # print("no more v to send from this station")
-                        if new_required_departure: # S'il reste des véhicules à faire partir dans le nouveau train  
-                            required_departure = new_required_departure
-                            required_departure = update_dep(required_departure) # to test
-                            veh_depart = [v[0] for k, v in sorted(required_departure.items())]
-                            new_required_departure = {}
-                            idx_role = 0
-                            # print("new_required_departure", veh_depart)
-
-                        else: # S'il ne reste pas de véhicules à faire partir
-                            inter_done = True # L'intervention est terminée
-                            if following_depart:
-                                inter_done = False
-                                stations = iter(pdd)
-                                station_lvl = 0
-                                required_departure = {i + 1: [v] for i, v in enumerate(new_veh_depart)}
-                                required_departure = update_dep(required_departure)
-                                veh_depart = new_veh_depart
-
-                                if len(veh_depart) > 5:
-                                    new_veh_depart = veh_depart[5:].copy()
-                                    veh_depart = veh_depart[:5]  
-                                    required_departure = {i + 1: [v] for i, v in enumerate(veh_depart)}
-                                    following_depart = True
-                                    # print("following_depart", veh_depart)
-                                
-                                new_required_departure = {}
-                                idx_role, num_d = 0, 1
-                                following_depart = False
-                                      
-                    else: # S'il y a des véhicules requis dans le train initial   
-    
-                        if (num_d == 99):
-                            current_station = next(stations_VSAV, False)
-                        if (num_d == 100):
-                            current_station = next(stations_FPT, False)
-                        if (num_d == 101):
-                            current_station = next(stations_EPA, False)
-                        # print(num_inter, "current_station", current_station, "num_d", num_d)
-                        # print("to return", fleet.VSAV.to_return, fleet.FPT.to_return, fleet.EPA.to_return)
-                            
-                        vehicles_to_find = iter(list_v)   
-                        vehicle_found = False
-                        vehicle_lvl = 1
-    
-                        if not current_station:
-                            vehicle_found = True
-                            # v_waiting = False
-                            # print('no station')
-                            all_ff_waiting = False
-                        
-                        while not vehicle_found: # Tant qu'on a pas trouvé le véhicule requis
-    
-                            vehicle_to_find = next(vehicles_to_find, False) # On cherche la prochaine fonction à faire partir  
-                            
-                            if not vehicle_to_find: # S'il n'y a plus de fonction à faire partir
-                                
-                                idx_role += team_max 
-                                vehicle_found = True
-                                new_required_departure[num_d] = list_v # Le véhicule requis est ajouté au nouveau train 
-                                dic_indic['function_not_found'] += 1
-                                # print("function not found")
-
-                            else: # S'il y a une fonction à faire partir depuis cette caserne
-                                # On cherche les véhicules disponibles dans la caserne actuelle correspondant à la fonction requise  
-
-                                # print(num_inter, "v_mat before li_mat_veh", v_mat_to_return)
-                                
-                                v_mats = dic_vehicles[current_station]["available"].copy()                             
-                                li_mat_veh = [v_m for v_m in v_mats if vehicle_to_find in dic_functions[v_m]]
-                                # li_mat_veh = [v_mat for v_mat in v_mats if any(func.startswith(vehicle_to_find) for func in dic_functions[v_mat])]
-    
-                                if li_mat_veh: # Si des véhicules ont la fonction requise   
-    
-                                    if fleet.VSAV.to_return and (current_station == fleet.VSAV.to_station) and (num_d == 99):
-                                        v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
-                                                                                   current_station, dic_vehicles, "VSAV", v_mat_to_return)
-                                        # print("VSAV_to_return", v_mat, v_waiting)
-                                        
-                                    elif fleet.FPT.to_return and (current_station == fleet.FPT.to_station) and (num_d == 100):
-                                        v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
-                                                                                   current_station, dic_vehicles, "FPT", v_mat_to_return)
-                                        # print("FPT_to_return", v_mat, v_waiting)
-                                        
-                                    elif fleet.EPA.to_return and (current_station == fleet.EPA.to_station) and (num_d == 101):
-                                        v_mat, v_waiting = v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, \
-                                                                                   current_station, dic_vehicles, "EPA", v_mat_to_return) 
-                                        # print("EPA_to_return", v_mat, v_waiting)
-                                        
-                                    else: 
-                                        v_mat = li_mat_veh[0] 
-                                        
-                                    if num_d < 99:
-                                        veh_depart[num_d-1] = vehicle_to_find
-
-                                    # print(num_inter, "veh_depart", veh_depart, "num_d", num_d, vehicle_to_find, v_mat, "found in", current_station)
-    
-                                    mandatory, team_max = get_mandatory_max(vehicle_to_find)
-                                    
-                                    # On met le véhicule en standby
-                                    dic_vehicles[current_station]["available"].remove(v_mat)
-                                    dic_vehicles[current_station]["standby"].append(v_mat) 
-                                    vehicle_found = True
-                                    # print(num_inter, "vehicle_found", dic_functions[v_mat],  v_mat, "in",  current_station, "num_d", num_d)
-    
-                                    # On cherche les rôles à pourvoir
-                                    roles = dic_roles[vehicle_to_find]
-                                    # print(roles)
-                                    role_number = iter(range(1, len(roles) + 1))
-                                    all_roles_found = False
-                                    degraded = False
-    
-                                    while not all_roles_found: # Tant que tous les rôles ne sont pas pourvus
-    
-                                        num_role = next(role_number, (0))  
-    
-                                        if num_role > team_max: # Pour limiter les rôles
-                                            num_role = 0
-                                                           
-                                        if not num_role: # S'il n'y a plus de rôles à pourvoir   
-                                            # print("no more role to fill", v_waiting)
-                                            all_roles_found = True
-                                            ff_to_send = planning[current_station][month][day][hour]['standby'].copy()
-                                            planning[current_station][month][day][hour]['standby'] = []    
-                                            dic_vehicles[current_station]["standby"].remove(v_mat)
-
-                                            if fleet.VSAV.needed and (num_d == 99): # DEPART VSAV EN RENFORT
-                                                dic_start_time[v_mat] = (month, day, hour)
-                                                fleet.VSAV.from_station, dic_vehicles, fleet.VSAV.arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, fleet.VSAV.needed, \
-                                                fleet.VSAV.sent  = reinforcement_sending(num_inter, current_station, fleet.VSAV.from_station, v_mat, \
-                                                                                   dic_vehicles, dic_station_distance, \
-                                                                                   fleet.VSAV.to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, fleet.VSAV.needed, \
-                                                                                   fleet.VSAV.sent, required_departure, \
-                                                                                   new_required_departure, num_d, "VSAV")
-                                                dic_indic['z1_VSAV_sent'] += 1
-
-                                            elif fleet.FPT.needed and (num_d == 100): # DEPART FPT EN RENFORT
-                                                dic_start_time[v_mat] = (month, day, hour)
-                                                fleet.FPT.from_station, dic_vehicles, fleet.FPT.arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, fleet.FPT.needed, \
-                                                fleet.FPT.sent  = reinforcement_sending(num_inter, current_station, fleet.FPT.from_station, v_mat, \
-                                                                                   dic_vehicles, dic_station_distance, \
-                                                                                   fleet.FPT.to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, fleet.FPT.needed, \
-                                                                                   fleet.FPT.sent, required_departure, \
-                                                                                   new_required_departure, num_d, "FPT")
-                                                dic_indic['z1_FPT_sent'] += 1
-
-                                            elif fleet.EPA.needed and (num_d == 101): # DEPART EPA EN RENFORT
-                                                dic_start_time[v_mat] = (month, day, hour)
-                                                fleet.EPA.from_station, dic_vehicles, fleet.EPA.arrival_num, dic_lent, \
-                                                dic_log, new_required_departure, fleet.EPA.needed, \
-                                                fleet.EPA.sent  = reinforcement_sending(num_inter, current_station, fleet.EPA.from_station, v_mat, \
-                                                                                   dic_vehicles, dic_station_distance, \
-                                                                                   fleet.EPA.to_station, date, df_pc, idx, \
-                                                                                   dic_lent, ff_to_send, dic_log, fleet.EPA.needed, \
-                                                                                   fleet.EPA.sent, required_departure, \
-                                                                                   new_required_departure, num_d, "EPA")
-                                                dic_indic['z1_EPA_sent'] += 1
-                                                # print(num_inter, "EPA", fleet.EPA.sent)
-
-                                            elif v_waiting: # RENFORT A RETOURNER
-
-                                                # print("v_waiting, all_ff_waiting", all_ff_waiting)
-
-                                                if all_ff_waiting: # RETOUR DES RENFORTS
-
-                                                    if fleet.VSAV.to_return and (num_d == 99):  # RETOUR DU VSAV
-                                                        fleet.VSAV.from_station, fleet.VSAV.to_station, fleet.VSAV.arrival_num, dic_back, dic_log, \
-                                                        fleet.VSAV.needed, fleet.VSAV.sent, all_ff_waiting, v_waiting, fleet.VSAV.to_return, \
-                                                        fleet.VSAV.returning = reinforcement_returning(num_inter, fleet.VSAV.to_station, fleet.VSAV.from_station, \
-                                                                                                 dic_log, \
-                                                                                                 v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.VSAV.needed, \
-                                                                                                 fleet.VSAV.sent, all_ff_waiting, v_waiting, \
-                                                                                                 fleet.VSAV.returning, "VSAV")
-
-                                                    elif fleet.FPT.to_return and (num_d == 100): # RETOUR DU FPT
-                                                        fleet.FPT.from_station, fleet.FPT.to_station, fleet.FPT.arrival_num, dic_back, dic_log, \
-                                                        fleet.FPT.needed, fleet.FPT.sent, all_ff_waiting, v_waiting, fleet.FPT.to_return, \
-                                                        fleet.FPT.returning = reinforcement_returning(num_inter, fleet.FPT.to_station, fleet.FPT.from_station, \
-                                                                                                dic_log, \
-                                                                                                v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.FPT.needed, \
-                                                                                                 fleet.FPT.sent, all_ff_waiting, v_waiting, \
-                                                                                                 fleet.FPT.returning, "FPT")
-
-                                                    elif fleet.EPA.to_return and (num_d == 101):  # RETOUR DE L'EPA
-                                                        fleet.EPA.from_station, fleet.EPA.to_station, fleet.EPA.arrival_num, dic_back, dic_log, \
-                                                        fleet.EPA.needed, fleet.EPA.sent, all_ff_waiting, v_waiting, fleet.EPA.to_return, \
-                                                        fleet.EPA.returning = reinforcement_returning(num_inter, fleet.EPA.to_station, fleet.EPA.from_station, \
-                                                                                                dic_log, \
-                                                                                                v_mat, dic_vehicles, dic_station_distance, date,\
-                                                                                                 df_pc, idx, dic_back, ff_to_send, fleet.EPA.needed, \
-                                                                                                 fleet.EPA.sent, all_ff_waiting, v_waiting, \
-                                                                                                 fleet.EPA.returning, "EPA")
-                                                  
-                                                else: # retour impossible, pompiers indisponibles
-
-                                                    # print("vehicle", vehicle_to_find, v_mat, 'available again in', current_station)
-                                                    v_waiting = False
-                                                    dic_vehicles[current_station]["available"].append(v_mat)
-                                                    planning[current_station][month][day][hour]['available'] += ff_to_send
-    
-                                            else: # départ de véhicule en inter
-
-                                                dic_inter[num_inter][current_station][v_mat] = ff_to_send
-                                                dic_vehicles[current_station]["inter"].append(v_mat)
-                                                
-                                                current_ff_inter += ff_to_send
-                                                for f in ff_to_send:
-                                                    dic_ff[f] = duration
-                                                
-                                                vehicle_out += 1
-
-                                                # print(num_inter, "vehicle out", current_station, v_mat, ff_to_send, vehicle_out, "|", fleet.VSAV.lent,"/", fleet.VSAV.disp, "|", fleet.FPT.lent,"/",fleet.FPT.disp, "|", fleet.EPA.lent,"/",fleet.EPA.disp)
-
-                                                dic_indic['v_sent'] += 1
-                                                if degraded: 
-                                                    dic_indic['v_degraded'] += 1 
-                                                else:
-                                                    dic_indic['v_sent_full'] += 1 
-                                                dic_indic['ff_sent'] += len(ff_to_send)
-
-                                                dic_veh_typ = update_dict(dic_veh_typ, vehicle_to_find) # metrique
-
-                                                if (current_station in Z_1): # GESTION DES RENFORTS
-    
-                                                    if not fleet.VSAV.sent: # s'il n'y a pas de renfort en route
-                                                        fleet.VSAV.disp, fleet.VSAV.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "VSAV") 
-                                                        
-                                                        stations_VSAV, fleet.VSAV.needed, fleet.VSAV.to_return, new_required_departure, fleet.VSAV.to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(fleet.VSAV.disp, fleet.VSAV.needed, fleet.VSAV.to_return, fleet.VSAV.lent, fleet.VSAV.to_station, \
-                                                                                new_required_departure, dic_station_distance, num_inter, dic_lent, \
-                                                                                dic_vehicles, dic_functions, dic_ff, 2, "VSAV", 99) 
-                                                        
-                                                        dic_indic['VSAV_needed'] += int(fleet.VSAV.needed)
-                                                        dic_indic['VSAV_disp'] = int(fleet.VSAV.disp)
-                                                        # print(num_inter, "v_mat", v_mat_to_return)
-    
-                                                    elif not fleet.FPT.sent:
-                                                        fleet.FPT.disp, fleet.FPT.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "FPT")
-                                                        
-                                                        stations_FPT, fleet.FPT.needed, fleet.FPT.to_return, new_required_departure, fleet.FPT.to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(fleet.FPT.disp, fleet.FPT.needed, fleet.FPT.to_return, fleet.FPT.lent, fleet.FPT.to_station, \
-                                                                                new_required_departure, dic_station_distance, num_inter, dic_lent, \
-                                                                                dic_vehicles, dic_functions, dic_ff, 2, "FPT", 100) 
-    
-                                                        dic_indic['FPT_needed'] += int(fleet.FPT.needed)
-                                                        dic_indic['FPT_disp'] = int(fleet.FPT.disp)
-                                                        # print(num_inter, "v_mat", v_mat_to_return)
-    
-                                                    elif not fleet.EPA.sent:
-                                                        fleet.EPA.disp, fleet.EPA.to_station = get_potential_veh(Z_1, dic_vehicles, dic_functions, "EPA")
-                                                        
-                                                        stations_EPA, fleet.EPA.needed, fleet.EPA.to_return, new_required_departure, fleet.EPA.to_station, \
-                                                        dic_ff, v_mat_to_return = veh_management(fleet.EPA.disp, fleet.EPA.needed, fleet.EPA.to_return, fleet.EPA.lent, fleet.EPA.to_station, \
-                                                                                new_required_departure, dic_station_distance, num_inter, dic_lent, \
-                                                                                dic_vehicles, dic_functions, dic_ff, 1, "EPA", 101)   
-    
-                                                        dic_indic['EPA_needed'] += int(fleet.EPA.needed)
-                                                        dic_indic['EPA_disp'] = int(fleet.EPA.disp)
-                                                        # print(num_inter, "v_mat", v_mat_to_return)
-
-                                        
-                                        else: # S'il y a un rôle à pourvoir
-
-                                            info_avail = get_neighborhood_availability(pdd, current_station, num_d, dic_vehicles, \
-                                                                                       planning, month, day, hour, 5) 
-    
-                                            ff_mats = planning[current_station][month][day][hour]["planned"].copy()
-
-                                            ff_existing = adding_lent_ff(fleet.VSAV.lent, fleet.FPT.lent, fleet.EPA.lent, \
-                                                                         current_station, Z_1, dic_lent, ff_mats, dic_ff)  
-                                            
-                                            if v_waiting:
-
-                                                # print("role to fill and v_waiting")
-
-                                                v_mat = v_mat_to_return
-
-                                                if fleet.VSAV.to_return and (current_station==fleet.VSAV.to_station) and "VSAV" in dic_functions[v_mat]:    
-                                                    all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
-                                                                                                   dic_lent, dic_ff, v_mat)
-                                                    # print("VSAV_to_return", fleet.VSAV.to_return, "all_ff_waiting", all_ff_waiting)
-    
-                                                if not all_ff_waiting and fleet.FPT.to_return and (current_station==fleet.FPT.to_station) and \
-                                                "FPT" in dic_functions[v_mat]:    
-                                                    all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
-                                                                                                   dic_lent, dic_ff, v_mat)
-                                                    fleet.VSAV.to_return = False
-                                                    # print("FPT_to_return", fleet.FPT.to_return, "all_ff_waiting", all_ff_waiting)
-                                                    
-                                                if not all_ff_waiting and fleet.EPA.to_return and (current_station==fleet.EPA.to_station) and \
-                                                "EPA" in dic_functions[v_mat]:   
-                                                    all_ff_waiting = are_all_ff_waiting(ff_existing, current_station, \
-                                                                                                   dic_lent, dic_ff, v_mat)
-                                                    fleet.FPT.to_return = False
-                                                    # print("EPA_to_return", fleet.EPA.to_return, "all_ff_waiting", all_ff_waiting)
-
-                                                if all_ff_waiting:
-                                                    # print("all_ff_waiting", v_mat, current_station)
-                                                    ff_existing = dic_lent[current_station][v_mat]
-                                                    # print(ff_existing)
-
-                                                else: 
-                                                    # print("not all ff waiting")
-                                                    ff_existing = [f for f in ff_existing if dic_ff[f] > -1].copy()
-                                                    fleet.EPA.to_return = False
-                                                    
-                                            else: # no vehicle waiting
-                                                lent_ff = [ff for v_m in dic_lent.values() for ff_lent in v_m.values() for ff in ff_lent]
-                                                ff_not_lent = [num for num in ff_existing if num not in lent_ff]
-                                                ff_existing = [f for f in ff_not_lent if dic_ff[f] > -1].copy()
-
-                                            ff_array = gen_ff_array(df_skills, skills_updated, ff_existing)
-
-                                            state = gen_state(veh_depart, idx_role, ff_array, ff_existing, \
-                                                              dic_roles, dic_roles_skills, dic_ff, df_skills, \
-                                                              coord_x, coord_y, month_sin, month_cos, day_sin, \
-                                                              day_cos, hour_sin, hour_cos, info_avail, max_duration, action_size)
-
-                                            action, skill_lvl, potential_actions = decide(
-                                                state, all_ff_waiting, ff_array, inter_done
-                                            )
-                                            
-                                            dic_indic, dic_lent, all_roles_found, vehicle_found, planning, dic_vehicles, dic_ff, idx_role, \
-                                            degraded = step(action, idx_role, ff_existing, all_ff_waiting, current_station, Z_1, dic_lent, \
-                                                            v_mat, dic_ff, fleet.VSAV.lent, fleet.FPT.lent, fleet.EPA.lent, planning, month, day, hour, num_inter, \
-                                                            new_required_departure, num_d, list_v, num_role, mandatory, degraded, team_max, \
-                                                            all_roles_found, vehicle_found, dic_vehicles, dic_indic, \
-                                                            skill_lvl, station_lvl)
-
-                                            # Before dic_indic_old is refreshed: the reward is the
-                                            # delta between the two, so the agent must read it here.
-                                            if on_action is not None:
-                                                on_action(ActionContext(
-                                                    state=state, action=action, skill_lvl=skill_lvl,
-                                                    num_d=num_d, inter_done=inter_done,
-                                                    dic_indic=dic_indic, dic_indic_old=dic_indic_old,
-                                                    potential_actions=potential_actions,
-                                                ))
-
-                                            dic_indic_old = dic_indic.copy()
-                                            action_num += 1 # for metrics
-
-
-                                # else: # si aucun véhicule n'a la fonction requise
-                                #     print(num_inter, veh_depart, vehicle_to_find, "no vehicule found")
-                                    
-
-        old_date = date
+        old_date = st.date
 
         # Two separate ticks, both keyed on RETURN events. The agent's epsilon
         # decay and checkpointing run on their own schedules, NOT on the logging
         # one — folding them together silently stops epsilon from decaying.
-        if required_departure == {0: "RETURN"}:
-            if on_interval is not None and num_inter % 100 == 0:
-                on_interval(num_inter, vehicle_out, fleet)
+        if st.required_departure == {0: "RETURN"}:
+            if on_interval is not None and st.num_inter % 100 == 0:
+                on_interval(st.num_inter, st.vehicle_out, fleet)
             if on_return is not None:
-                on_return(num_inter)
+                on_return(st.num_inter)
 
     # Hand back what the callers report on.
-    env.dic_indic = dic_indic
-    env.dic_vehicles = dic_vehicles
-    env.planning = planning
-    env.dic_ff = dic_ff
+    env.dic_indic = st.dic_indic
+    env.dic_vehicles = st.dic_vehicles
+    env.planning = st.planning
+    env.dic_ff = st.dic_ff
     return {
-        "vehicle_out": vehicle_out,
-        "action_num": action_num,
-        "vehicle_evo": vehicle_evo,
+        "vehicle_out": st.vehicle_out,
+        "action_num": st.action_num,
+        "vehicle_evo": st.vehicle_evo,
     }
