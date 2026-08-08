@@ -16,6 +16,9 @@ export RL_DATA_ROOT=/path/to/data     # holds Data/, Data_preprocessed/, ...
 `paths.py` resolves everything from that root, so the scripts run from any
 directory. Without it they look next to the repo.
 
+For what that tree has to contain before any of this runs — and what is
+generated rather than shipped — see **[DATA_FILES.md](DATA_FILES.md)**.
+
 ---
 
 ## 0. Before and after any change
