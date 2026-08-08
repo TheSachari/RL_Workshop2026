@@ -27,6 +27,11 @@ Reward_weights/
 # are anchored to the repo root, so they do not cover it when it is nested.
 Git_version_final/
 
+# Output tree for a full pipeline run: inputs are symlinks to the source data,
+# everything else is generated. Currently invisible to git only because its
+# contents happen to match the *.pkl / *.pt rules above.
+run_full/
+
 # Model weights and datasets
 *.pkl
 *.pt
