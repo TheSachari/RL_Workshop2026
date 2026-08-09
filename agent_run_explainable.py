@@ -70,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_name", type=str, default=None, help="Resumable checkpoint file (default: <model_name>.ckpt)")
     parser.add_argument("--checkpoint_every", type=int, default=10000, help="Write a resumable checkpoint every N interventions")
     parser.add_argument("--no_save_buffer", action='store_true', help="Omit the replay buffer from checkpoints (smaller files, colder resume)")
+    parser.add_argument("--detect_anomaly", action='store_true', help="Enable torch autograd anomaly detection (slow; for debugging NaNs)")
 
     args = parser.parse_args()
 
@@ -81,7 +82,10 @@ if __name__ == "__main__":
         hyper_params = json.load(f)
 
     device = torch.device(hyper_params["device"])
-    torch.autograd.set_detect_anomaly(True)
+    # Off by default: anomaly mode records a stack trace for every autograd op
+    # to attribute a future NaN, which costs real time on a run measured in
+    # hours. Turn it on with --detect_anomaly when a NaN actually appears.
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
     hyper_params["max_train_steps"] = (args.end-args.start) * 5 # (approx. 5 actions by intervention)
     print("max_train_steps", hyper_params["max_train_steps"])
     if args.agent_model == "dqn":

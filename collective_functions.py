@@ -31,6 +31,11 @@ from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F4
 # across replicates; the default keeps a plain run reproducible.
 DEFAULT_SEED = 42
 
+# Skill validity windows, split out of the skills table once per table. Keyed by
+# `id(df_skills)` with the shape stored alongside as a guard -- see
+# `_skill_windows`. A run holds one or two tables, so this stays tiny.
+_SKILL_WINDOW_CACHE = {}
+
 def get_skills_from_role(df_roles, role):
     """
     Return the skill requirement expression for a given role.
@@ -1730,6 +1735,47 @@ def update_duration(date, old_date, current_ff_inter, dic_ff):
 
     return dic_ff
 
+def _skill_windows(df_skills):
+    """Return `(starts, ends)` as two float64 arrays of shape (n_ff, n_skills).
+
+    Splitting the validity windows out of the DataFrame once is what makes
+    `update_skills` cheap: the split is per-table, while the comparison against
+    a date is per-event.
+
+    Cached on the table's identity *and* shape. Identity alone is not safe here
+    -- `explainability.get_rare_skills_from_planed_ff` passes a row-filtered
+    view, and CPython reuses the id of a garbage-collected temporary -- so the
+    shape is checked before a hit is trusted, and the entry is dropped if it
+    does not match.
+
+    NaT becomes NaN, and every comparison against NaN is False, which
+    reproduces the `fillna(False)` the pandas version ended with.
+    """
+    key = id(df_skills)
+    hit = _SKILL_WINDOW_CACHE.get(key)
+    if hit is not None and hit[0] == df_skills.shape:
+        return hit[1], hit[2]
+
+    level0 = df_skills.columns.get_level_values(0)
+    level1 = df_skills.columns.get_level_values(1)
+
+    skills = list(dict.fromkeys(level0))
+    position = {name: i for i, name in enumerate(skills)}
+    start_cols = np.empty(len(skills), dtype=int)
+    end_cols = np.empty(len(skills), dtype=int)
+    for column, (name, bound) in enumerate(zip(level0, level1)):
+        target = start_cols if bound == "Début" else end_cols
+        target[position[name]] = column
+
+    # datetime64 -> float64 via NaT-preserving view: NaT becomes NaN, so the
+    # comparisons below are False for it, as `fillna(False)` made them.
+    values = df_skills.to_numpy(dtype="datetime64[ns]").astype("float64")
+    starts, ends = values[:, start_cols], values[:, end_cols]
+
+    _SKILL_WINDOW_CACHE[key] = (df_skills.shape, starts, ends)
+    return starts, ends
+
+
 def update_skills(df_skills, date_reference):
     """
     Compute a binary "skills_updated" matrix indicating which skills are valid at a reference date.
@@ -1746,17 +1792,17 @@ def update_skills(df_skills, date_reference):
     numpy.ndarray
         Binary matrix indicating current skill validity for each firefighter and skill,
         aligned to the ordering used by `df_skills`.
-    """
 
-    condition_list = []
-    for col in df_skills.columns.get_level_values(0).unique():
-        deb_col = (col, 'Début')
-        fin_col = (col, 'Fin')    
-        condition = (df_skills[deb_col] <= date_reference) & (df_skills[fin_col] >= date_reference)
-        condition_list.append(condition.rename(col))
-        
-    conditions = pd.concat(condition_list, axis=1)
-    return np.where(conditions.fillna(False), 1, 0)
+    Notes
+    -----
+    This used to build one pandas Series comparison per skill (134 of them) and
+    `pd.concat` the lot, on every event whose date advanced the reference --
+    77% of a training run's wall time, dwarfing the network's own forward and
+    backward passes. The comparison is the same one, done once over two arrays.
+    """
+    starts, ends = _skill_windows(df_skills)
+    reference = np.datetime64(pd.Timestamp(date_reference), "ns").astype("float64")
+    return np.where((starts <= reference) & (ends >= reference), 1, 0)
 
 def update_dep(required_departure):
     """
