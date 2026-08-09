@@ -40,6 +40,7 @@ import random
 import numpy as np
 import torch
 
+import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
 from collective_functions import DEFAULT_SEED, compute_reward, load_environment
 from explainability import get_dic_rare_skills, get_related_rows_in_time
@@ -66,6 +67,10 @@ if __name__ == "__main__":
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
     parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
+    parser.add_argument("--resume", action='store_true', help="Resume from the checkpoint written by --checkpoint_name")
+    parser.add_argument("--checkpoint_name", type=str, default=None, help="Resumable checkpoint file (default: <model_name>.ckpt)")
+    parser.add_argument("--checkpoint_every", type=int, default=10000, help="Write a resumable checkpoint every N interventions")
+    parser.add_argument("--no_save_buffer", action='store_true', help="Omit the replay buffer from checkpoints (smaller files, colder resume)")
 
     args = parser.parse_args()
 
@@ -90,9 +95,22 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown --agent_model: {args.agent_model!r}")
 
     model_path = resolve(args.model_name, SVG_MODEL)
+    ckpt_path = resolve(args.checkpoint_name or (args.model_name + ".ckpt"), SVG_MODEL)
+
+    # Loaded before the environment so a settings mismatch is refused up front,
+    # rather than after several minutes of environment building.
+    resume_payload = None
+    if args.resume:
+        if not args.train:
+            raise SystemExit("--resume only applies to training runs (use --train).")
+        if not ckpt_path.exists():
+            raise SystemExit(f"--resume: no checkpoint at {ckpt_path}")
+        resume_payload = ckpt.load(ckpt_path, map_location=hyper_params.get("device", "cpu"))
+        ckpt.check_compatible(resume_payload, args)
+        print(f"Resuming from {ckpt_path} at intervention {resume_payload['num_inter']}", flush=True)
 
     if args.train:
-        if args.load:
+        if args.load and not args.resume:
             agent.qnetwork_local.load_state_dict(torch.load(model_path, weights_only=True))
             print("Weights loaded")
         agent.qnetwork_local.train()
@@ -131,6 +149,22 @@ if __name__ == "__main__":
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
     eps_update = (args.end - args.start) // 23  # ~23 steps to reach 5% of eps
+
+    # Applied after `load_environment` so the checkpoint's containers overwrite
+    # the freshly built ones, and after `rl` exists so epsilon and its decay
+    # counter come back together — restoring eps without `d` would put the decay
+    # back on the wrong rung.
+    resume_from = None
+    loop_seed = None
+    if resume_payload is not None:
+        restored = ckpt.restore(resume_payload, agent=agent, env=env, rl=rl)
+        fleet = restored["fleet"]
+        resume_from = restored["row_index"]
+        loop_seed = restored["loop"]
+        reward_evo = restored["reward_evo"]
+        dic_saved_skills = restored["dic_saved_skills"]
+        print("Resumed: eps", rl["eps"], "d", rl["d"], "t_step", agent.t_step, flush=True)
+
     print("eps_start", rl["eps"], "eps_update", eps_update, flush=True)
 
     def on_row(idx, date, pdd, df_pc):
@@ -181,19 +215,44 @@ if __name__ == "__main__":
         print(f"{num_inter} v_out: {vehicle_out} | rwd_mean: {rwd_mean:.2f} | v1notfroms1: {dic_indic['v1_not_sent_from_s1']} | v3notfroms3: {dic_indic['v3_not_sent_from_s3']} | v_not_found_ls: {dic_indic['v_not_found_in_last_station']} | deg: {dic_indic['v_degraded']} | rupture_ff: {dic_indic['rupture_ff']}", flush=True)
         print(f"{num_inter} z1_VSAV_sent: {dic_indic['z1_VSAV_sent']} | z1_FPT_sent: {dic_indic['z1_FPT_sent']} | z1_EPA_sent: {dic_indic['z1_EPA_sent']} | VSAV_disp: {fleet.VSAV.disp} | FPT_disp: {fleet.FPT.disp} | EPA_disp: {fleet.EPA.disp} |", flush=True)
 
+    # `run_simulation` builds `_LoopState` internally; this hands it back so a
+    # checkpoint can capture the bookkeeping that lives only inside the loop.
+    live = {"st": None}
+
+    def on_state_ready(st):
+        live["st"] = st
+
     def on_return(num_inter):
         """Runs on every RETURN event — not on the 100-tick logging schedule."""
         if args.eps_start > 0 and eps_update and num_inter % eps_update == 0:
             rl["eps"] = max(0.05, rl["eps"] * 0.99 ** rl["d"])
             rl["d"] += 1
 
-        if num_inter % 10000 == 0 and args.train:
+        if args.checkpoint_every and num_inter % args.checkpoint_every == 0 and args.train:
+            st = live["st"]
+            # The weights file stays a plain state_dict so eval runs (--load
+            # without --resume) keep working unchanged.
             torch.save(agent.qnetwork_local.state_dict(), model_path)
-            print(num_inter, "Agent saved as", args.model_name, flush=True)
+            ckpt.save(
+                ckpt_path,
+                agent=agent, env=env, fleet=fleet, loop=st, rl=rl,
+                num_inter=num_inter,
+                row_index=st.idx if st is not None else None,
+                old_date=env.old_date,
+                date_reference=env.date_reference,
+                reward_evo=reward_evo,
+                dic_saved_skills=dic_saved_skills,
+                args=args,
+                include_buffer=not args.no_save_buffer,
+            )
+            print(num_inter, "Agent saved as", args.model_name,
+                  "| checkpoint", ckpt_path.name, flush=True)
 
     run_simulation(env, fleet, decide, action_size=action_size,
                    on_row=on_row, on_action=on_action,
-                   on_interval=log_interval, on_return=on_return)
+                   on_interval=log_interval, on_return=on_return,
+                   resume_from=resume_from, loop_state=loop_seed,
+                   on_state_ready=on_state_ready)
 
     dic_indic = env.dic_indic
     print("Simulation done")

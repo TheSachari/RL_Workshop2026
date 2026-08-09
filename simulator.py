@@ -667,6 +667,9 @@ def run_simulation(
     on_action: Optional[Callable[[ActionContext], None]] = None,
     on_interval=None,
     on_return=None,
+    resume_from=None,
+    loop_state=None,
+    on_state_ready=None,
 ):
     """Run the event stream, delegating each action choice to `decide`.
 
@@ -677,6 +680,15 @@ def run_simulation(
     `on_row(row_fields)` runs once per event before it is handled (the agent
     runner uses it to precompute upcoming rare skills). `on_interval(num_inter)`
     runs on the loop's periodic logging tick.
+
+    Resuming
+    --------
+    `resume_from` is the event index of the last row a checkpoint covered; rows
+    up to and including it are skipped, so the stream continues *after* it
+    rather than replaying it. `loop_state` seeds the cross-event `_LoopState`
+    fields from that checkpoint, and `on_state_ready(st)` hands the caller the
+    live state object so a checkpoint can capture it mid-run. All three default
+    to None, leaving a normal run byte-for-byte on its original path.
     """
     st = _LoopState(
         dic_vehicles=env.dic_vehicles,
@@ -702,10 +714,25 @@ def run_simulation(
         on_action=on_action,
     )
 
+    # Seed the cross-event fields from a checkpoint before the loop starts, so
+    # the first resumed event sees the same bookkeeping the interrupted run had.
+    if loop_state:
+        for key, value in loop_state.items():
+            setattr(st, key, value)
+
+    if on_state_ready is not None:
+        on_state_ready(st)
+
     old_date = env.old_date
     date_reference = env.date_reference
 
     for row in st.df_pc.itertuples(index=True, name=None):
+
+        # Skip everything the checkpoint already accounted for. Comparing on the
+        # row index (not a counter) keeps this correct even though `num_inter`
+        # repeats across the departure/RETURN pair of a single intervention.
+        if resume_from is not None and row[0] <= resume_from:
+            continue
 
         _unpack_row(st, row)
 
@@ -717,6 +744,12 @@ def run_simulation(
         if st.date >= date_reference:
             date_reference = st.date
             st.skills_updated = update_skills(st.df_skills, date_reference)
+
+        # Both dates are loop locals, so a checkpoint taken from a callback
+        # would otherwise read whatever `load_environment` left on `env` rather
+        # than where the run has actually got to. Mirror them as we go.
+        env.old_date = old_date
+        env.date_reference = date_reference
 
         _handle_arrivals(st)
 
