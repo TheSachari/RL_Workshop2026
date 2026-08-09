@@ -44,6 +44,7 @@ import torch
 import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
 from collective_functions import DEFAULT_SEED, compute_reward, load_environment
+from decision_log import DecisionLog
 from explainability import get_dic_rare_skills, get_related_rows_in_time
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
@@ -72,6 +73,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_every", type=int, default=10000, help="Write a resumable checkpoint every N interventions")
     parser.add_argument("--no_save_buffer", action='store_true', help="Omit the replay buffer from checkpoints (smaller files, colder resume)")
     parser.add_argument("--detect_anomaly", action='store_true', help="Enable torch autograd anomaly detection (slow; for debugging NaNs)")
+    parser.add_argument("--decision_log", type=str, default=None, help="Record per-decision explanations to this file in Plots/ (eval runs)")
+    parser.add_argument("--decision_log_rate", type=float, default=0.01, help="Sampling rate for decisions that are neither close nor skill-relevant")
+    parser.add_argument("--decision_log_margin", type=float, default=0.5, help="Q-value gap below which a decision counts as close")
+    parser.add_argument("--decision_log_quantiles", action='store_true', help="Also store the per-action return distribution (larger file)")
 
     args = parser.parse_args()
 
@@ -171,6 +176,19 @@ if __name__ == "__main__":
 
     print("eps_start", rl["eps"], "eps_update", eps_update, flush=True)
 
+    # Off unless asked for. Intended for evaluation runs: it explains a settled
+    # policy, and during training the thing being explained changes underneath
+    # you as the weights move.
+    decision_log = None
+    if args.decision_log:
+        decision_log = DecisionLog(
+            resolve(args.decision_log, PLOTS),
+            rate=args.decision_log_rate,
+            margin=args.decision_log_margin,
+            keep_quantiles=args.decision_log_quantiles,
+        )
+        print("Decision log ->", decision_log.path, flush=True)
+
     def on_row(idx, date, pdd, df_pc):
         if pdd:
             upcoming["skills"] = get_related_rows_in_time(
@@ -189,7 +207,12 @@ if __name__ == "__main__":
         else:
             rl["loss"] = 0
 
-        action, skill_lvl, potential_actions = agent.act(state, all_ff_waiting, rl["eps"])
+        # Only ask for the Q-values when something will read them: filling the
+        # dict copies a value per feasible action on every decision.
+        explain = {} if decision_log is not None else None
+        action, skill_lvl, potential_actions = agent.act(
+            state, all_ff_waiting, rl["eps"], explain=explain
+        )
 
         # Explainability: did this choice preserve a rare skill that some other
         # feasible firefighter also carried?
@@ -200,6 +223,17 @@ if __name__ == "__main__":
                 flat_list = list({e for l1 in lol_skills_ff for e in l1})
                 if (urs not in dic_rare_skills[action]) and (urs in flat_list):
                     dic_saved_skills[urs] += 1
+
+        if decision_log is not None:
+            st = live["st"]
+            decision_log.consider(
+                num_inter=st.num_inter, idx_role=st.idx_role, num_d=st.num_d,
+                current_station=st.current_station, v_mat=st.v_mat, date=st.date,
+                action=action, potential_actions=potential_actions,
+                ff_existing=st.ff_existing, dic_rare_skills=dic_rare_skills,
+                upcoming_skills=upcoming["skills"], skill_lvl=skill_lvl,
+                explain=explain,
+            )
 
         rl["action"] = action
         rl["old_state"] = state
@@ -256,6 +290,9 @@ if __name__ == "__main__":
                 os.fsync(f.fileno())
             os.replace(tmp, path)
 
+        if decision_log is not None:
+            decision_log.flush()
+
     def on_return(num_inter):
         """Runs on every RETURN event — not on the 100-tick logging schedule."""
         if args.eps_start > 0 and eps_update and num_inter % eps_update == 0:
@@ -295,3 +332,7 @@ if __name__ == "__main__":
 
     save_metrics(live["st"].num_inter if live["st"] is not None else None)
     print("Metrics saved to", metrics_path, "and", curves_path)
+
+    if decision_log is not None:
+        print("Decision log saved to", decision_log.flush())
+        print("  ", decision_log.summary())

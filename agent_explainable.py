@@ -680,17 +680,30 @@ class FQFAgent:
         state: np.ndarray,
         all_ff_waiting,
         eps: float = 0.0,
+        explain: Optional[dict] = None,
     ) -> Tuple[int, int, List[int]]:
         """Epsilon-greedy action selection based on expected value over quantiles.
 
         Returns the feasible actions alongside the choice: callers use them for
         explainability (which alternatives were available and rejected).
+
+        `explain`, when given, is filled in place with the quantities this
+        method computes and would otherwise discard: the Q-value of every
+        feasible action, and the quantiles of the return distribution behind
+        them. They are the numbers the choice was actually made from, so a log
+        built on them explains the decision rather than approximating it. The
+        return value is unchanged either way, so callers that pass nothing are
+        unaffected.
         """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
 
         if np.random.uniform() <= eps:
             action = random.choice(potential_actions)
             skill_lvl = potential_skills[potential_actions.index(action)]
+            if explain is not None:
+                # An exploratory action has no Q behind it; say so rather than
+                # let a reader mistake the greedy values for the reason.
+                explain.update(random=True, q_values=None, quantiles=None)
             return action, skill_lvl, potential_actions
 
         state_t = torch.from_numpy(state.flatten()).float().to(self.device)
@@ -706,6 +719,21 @@ class FQFAgent:
         q_list = q.detach().cpu().numpy().flatten().tolist()
         action = filter_q_values(q_list, potential_actions)
         skill_lvl = potential_skills[potential_actions.index(action)]
+
+        if explain is not None:
+            explain.update(
+                random=False,
+                q_values={int(a): float(q_list[a]) for a in potential_actions},
+                # Per-action return distribution. FQF models the whole
+                # distribution and then averages it away; two actions with the
+                # same mean can carry very different downside, which is the
+                # distinction that matters when the cost is a coverage gap.
+                quantiles={
+                    int(a): f_z[0, :, a].detach().cpu().numpy().astype("float32")
+                    for a in potential_actions
+                },
+            )
+
         return action, skill_lvl, potential_actions
 
     def soft_update(self, local_model: torch.nn.Module, target_model: torch.nn.Module) -> None:

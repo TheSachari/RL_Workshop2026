@@ -221,6 +221,9 @@ class _LoopState:
     vehicle_to_find: Any = None
     vehicle_found: bool = False
     degraded: bool = False
+    # The crew `decide` is currently choosing from; an action index is a
+    # position in this list. Set by `_fill_roles`, read by explainability.
+    ff_existing: list = field(default_factory=list)
 
 
 def _unpack_row(st: _LoopState, row) -> None:
@@ -423,6 +426,10 @@ def _fill_roles(st: _LoopState) -> None:
         )
 
         ff_existing = _resolve_crew(st)
+        # Also on `st`: an action index is a position in this list, so anything
+        # explaining a choice needs it to name the firefighter behind it, and
+        # `decide` does not receive it as an argument.
+        st.ff_existing = ff_existing
         ff_array = gen_ff_array(st.df_skills, st.skills_updated, ff_existing)
 
         state = gen_state(st, ff_array, ff_existing, info_avail)
