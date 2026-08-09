@@ -1609,78 +1609,47 @@ def reinforcement_returning(num_inter, v_to_station, v_from_station, dic_log, v_
 
     return v_from_station, v_to_station, arrival_num, dic_back, dic_log, v_needed, v_sent, all_ff_waiting, v_waiting, v_to_return, v_returning
 
-def reinforcement_sending(num_inter, current_station, v_from_station, v_mat, dic_vehicles, \
-    dic_station_distance, v_to_station, date, df_pc, idx, dic_lent, \
-    ff_to_send, dic_log, v_needed, v_sent, \
-    required_departure, new_required_departure, num_d, v_type):
-    
+def reinforcement_sending(st, r, ff_to_send, v_type):
     """
     Send a vehicle as reinforcement to a Z1 station and schedule its arrival.
 
     Parameters
     ----------
-    num_inter : int
-        Current intervention id.
-    current_station : str
-        Station currently being processed (often Z1 destination).
-    v_from_station : str
-        Origin station for the reinforcement.
-    v_mat : str
-        Vehicle/material id being sent.
-    dic_vehicles : dict
-        Vehicle pools (mutated).
-    dic_station_distance : dict
-        Distance ordering used to estimate routing/arrival.
-    v_to_station : str
-        Destination station.
-    date : pandas.Timestamp
-        Current timestamp.
-    df_pc : pandas.DataFrame
-        Event stream.
-    idx : int
-        Current event row index.
-    dic_lent : dict
-        Lent structure (mutated).
+    st : _LoopState
+        Loop state, read and mutated in place (`dic_vehicles`, `dic_lent`,
+        `dic_log`, `new_required_departure`, and the event's position in the
+        stream).
+    r : ReinforcementState
+        The reinforcement bookkeeping for `v_type`. `from_station`,
+        `arrival_num`, `needed` and `sent` are written back onto it.
     ff_to_send : list[int]
         Firefighters assigned to the reinforcement.
-    dic_log : dict
-        Log structure (mutated).
-    v_needed : bool
-        Flag indicating a reinforcement is needed.
-    v_sent : bool
-        Flag indicating a reinforcement is currently in transit.
-    required_departure : dict
-        Current departure requirements.
-    new_required_departure : dict
-        Mutable dict for additional requirements.
-    num_d : int
-        Departure step number.
     v_type : str
-        Vehicle type.
+        Vehicle type (VSAV, FPT or EPA).
 
-    Returns
-    -------
-    tuple
-        Updated (v_from_station, dic_vehicles, arrival_num, dic_lent, dic_log,
-        new_required_departure, v_needed, v_sent)
+    Side Effects
+    ------------
+    Mutates `st` and `r` in place; returns nothing.
+
+    Notes
+    -----
+    Previously took 19 positional parameters and returned an 8-tuple that the
+    caller destructured across `r` and `st`. Two of those parameters,
+    `num_inter` and `required_departure`, were never read in the body.
     """
 
-    v_from_station = current_station
-    dic_vehicles[v_from_station][v_type+"_sent"].append(v_mat)
-    arrival_time = date + timedelta(minutes = dic_station_distance[v_to_station][v_from_station] + 20)
-    arrival_num = df_pc.loc[(df_pc.index >= idx) & (df_pc["date"] >= arrival_time), "num_inter"].iloc[0]
-    # print(num_inter, v_type, v_mat, ff_to_send, "sent from", v_from_station, "will arrive at", arrival_num, "to", v_to_station)
-    dic_lent[v_to_station][v_mat] = ff_to_send.copy() # mise à disposition des pompiers
-    dic_log[v_mat] = v_from_station
-    # print("reinforcement_sending", dic_log)
+    r.from_station = st.current_station
+    st.dic_vehicles[r.from_station][v_type+"_sent"].append(st.v_mat)
+    arrival_time = st.date + timedelta(minutes = st.dic_station_distance[r.to_station][r.from_station] + 20)
+    r.arrival_num = st.df_pc.loc[(st.df_pc.index >= st.idx) & (st.df_pc["date"] >= arrival_time), "num_inter"].iloc[0]
+    st.dic_lent[r.to_station][st.v_mat] = ff_to_send.copy() # mise à disposition des pompiers
+    st.dic_log[st.v_mat] = r.from_station
 
-    if num_d in new_required_departure:
-        del new_required_departure[num_d]
+    if st.num_d in st.new_required_departure:
+        del st.new_required_departure[st.num_d]
 
-    v_needed = False
-    v_sent += 1
-
-    return v_from_station, dic_vehicles, arrival_num, dic_lent, dic_log, new_required_departure, v_needed, v_sent 
+    r.needed = False
+    r.sent += 1
 
 def v_to_return_managing(dic_log, li_mat_veh, v_waiting, vehicle_to_find, current_station, dic_vehicles, v_type, v_mat_to_return):
 

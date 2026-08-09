@@ -305,16 +305,7 @@ def _send_reinforcement(st: _LoopState, ff_to_send: list) -> bool:
             continue
 
         st.dic_start_time[st.v_mat] = (st.month, st.day, st.hour)
-        (
-            r.from_station, st.dic_vehicles, r.arrival_num, st.dic_lent,
-            st.dic_log, st.new_required_departure, r.needed, r.sent,
-        ) = reinforcement_sending(
-            st.num_inter, st.current_station, r.from_station, st.v_mat,
-            st.dic_vehicles, st.dic_station_distance, r.to_station, st.date,
-            st.df_pc, st.idx, st.dic_lent, ff_to_send, st.dic_log, r.needed,
-            r.sent, st.required_departure, st.new_required_departure,
-            st.num_d, v_type,
-        )
+        reinforcement_sending(st, r, ff_to_send, v_type)
         st.dic_indic[f"z1_{v_type}_sent"] += 1
         return True
     return False
