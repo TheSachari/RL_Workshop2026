@@ -8,9 +8,9 @@ imported without triggering I/O. When run as a script, it loads raw files from
 `./Data/`, runs preprocessing, and writes pickled artifacts to `./Data_preprocessed/`.
 """
 
+import argparse
 import re
 
-import argparse
 import geopandas as gpd
 import numpy as np
 import pandas as pd

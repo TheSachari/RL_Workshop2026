@@ -25,7 +25,7 @@ It is safe to import from other modules and notebooks.
 
 import random
 from copy import deepcopy
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import schedulefree
@@ -34,13 +34,13 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from base import BaseSynthesizer, random_state
-from paths import SVG_MODEL
 from data import prepare_fast_dataloader
 from gaussian_multinomial_diffusion import GaussianMultinomialDiffusion
-from utils_train import get_model, update_ema
 
 # Project modules (likely define model blocks, layers, etc.)
 from modules import *  # noqa: F403, F401
+from paths import SVG_MODEL
+from utils_train import get_model, update_ema
 
 
 class RandomWalkDataset(IterableDataset):

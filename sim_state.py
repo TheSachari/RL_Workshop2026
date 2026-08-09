@@ -24,7 +24,6 @@ state without merging the code paths.
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-
 # Departure sentinel identifying a reinforcement request per vehicle type.
 # Used as `num_d == 99` for VSAV, 100 for FPT, 101 for EPA.
 SENTINEL = {"VSAV": 99, "FPT": 100, "EPA": 101}

@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from collective_functions import update_skills
 from paths import DATA_ENVIRONMENT, DATA_SAMPLED, resolve
+
 tqdm.pandas()
 
 
@@ -53,9 +54,7 @@ def get_rare_skills_from_dep(required_departure, counts, rarity, dic_roles, dic_
 def get_rare_skills(rare_skills, ff_skills, rarity = 50, skill_lvl_gt = 0):
     pos_in_b = ff_skills > skill_lvl_gt                   
     a_lt50   = rare_skills < rarity                    
-    match    = pos_in_b & a_lt50[None,:] 
-    any_match_per_row  = match.any(axis=1)                     
-    all_pos_ok_per_row = (~pos_in_b | a_lt50[None,:]).all(axis=1)
+    match    = pos_in_b & a_lt50[None,:]
     return np.unique(np.concatenate([np.where(row)[0] for row in match]))
 
 def get_all_planed_ff(planning, month, day, hour, df_stations):

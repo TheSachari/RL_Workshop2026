@@ -17,10 +17,12 @@ Import safety
 This module defines classes only and has no top-level execution block.
 """
 
-import numpy as np 
-from collections import deque, namedtuple
 import random
+from collections import deque, namedtuple
+
+import numpy as np
 import torch
+
 
 class DT_ReplayBuffer:
     """

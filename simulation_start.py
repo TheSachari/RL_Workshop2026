@@ -1,9 +1,10 @@
-import numpy as np
-import random
-import pickle
 import argparse
-# from tqdm.notebook import trange, tqdm
+import pickle
+import random
 
+import numpy as np
+
+# from tqdm.notebook import trange, tqdm
 from collective_functions import (
     DEFAULT_SEED,
     apply_logic,

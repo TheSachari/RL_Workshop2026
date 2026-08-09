@@ -16,15 +16,13 @@ pure/functional interface.
 """
 
 
-import numpy as np
-import re
-import pandas as pd
-from datetime import datetime, timedelta
-import random
-import os
-import json
 import pickle
-import torch
+import random
+import re
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
 
 from paths import DATA_ENVIRONMENT, resolve
 from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F401
@@ -211,10 +209,10 @@ def get_potential_actions(state, all_ff_waiting):
         potential_skills = [0]
 
     if potential_actions == [79]:
-        assert np.all(state[-1] == 0), f"FF is on slot 79"
+        assert np.all(state[-1] == 0), "FF is on slot 79"
 
     if all_ff_waiting:
-        assert potential_actions == [0], f"not action 0 and all_ff_waiting"
+        assert potential_actions == [0], "not action 0 and all_ff_waiting"
 
         
     return potential_actions, potential_skills

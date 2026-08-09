@@ -14,10 +14,8 @@ If you rename public classes, keep the backward-compatible aliases at the bottom
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
-
 import random
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import schedulefree
@@ -28,14 +26,14 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 
 from collective_functions import get_potential_actions
-from IntrinsicCuriosityModule import Forward, ICM, Inverse
+from IntrinsicCuriosityModule import ICM, Forward, Inverse
 from networks import (
+    FPN,
+    QVN,
     DT_Network,
     Dueling_QNetwork,
-    FPN,
     PPO_ActorCriticAM,
     PPOActorCritic,
-    QVN,
 )
 from ReplayBuffers import (
     DT_ReplayBuffer,

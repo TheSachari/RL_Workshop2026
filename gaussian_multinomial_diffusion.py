@@ -3,11 +3,12 @@ Based on https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
 and https://github.com/ehoogeboom/multinomial_diffusion
 """
 
-import torch.nn.functional as F
-import torch
 import math
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+
 from utils import (
     FoundNANsError,
     default,

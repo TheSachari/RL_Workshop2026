@@ -48,7 +48,6 @@ from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
 from simulator import run_simulation
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent parameters")
     parser.add_argument("--hyper_params", type=str, help="Agent hyper parameters")

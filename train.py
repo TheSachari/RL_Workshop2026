@@ -30,10 +30,9 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import QuantileTransformer
 
-from paths import DATA_PREPROCESSED, DATA_TRAINED
-
 from data import raw_dataset_from_df
 from ddpm import DDPM
+from paths import DATA_PREPROCESSED, DATA_TRAINED
 
 
 def quantile_transform(

@@ -26,17 +26,15 @@ Notes
 - Some parts include asserts intended to help debugging/compilation (e.g., in DT_Network).
 """
 
-import torch
-import torch.nn as nn
-# --- Optionnel : neutraliser torch.compile pour ce module si activé ailleurs
-
-import torch._dynamo as dynamo
-torch.set_float32_matmul_precision('high')
+import math
 
 import numpy as np
-import math
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from copy import copy
+
+# --- Optionnel : neutraliser torch.compile pour ce module si activé ailleurs
+torch.set_float32_matmul_precision('high')
 
 class SafeBatchNorm1d(nn.BatchNorm1d):
     """BatchNorm1d that safely handles batch of size 1 during training.
@@ -592,7 +590,7 @@ class QVN(nn.Module):
         See implementation.
         """
 
-        if embedding==None:
+        if embedding is None:
             x = self.head(x)
         else:
             x = embedding

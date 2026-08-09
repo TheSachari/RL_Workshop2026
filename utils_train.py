@@ -1,7 +1,7 @@
 import numpy as np
-import os
 
 from modules import MLPDiffusion, ResNetDiffusion
+
 
 def get_model(
     model_name,

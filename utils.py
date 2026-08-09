@@ -1,8 +1,8 @@
-import torch
-import numpy as np
-import torch.nn.functional as F
-from torch.profiler import record_function
 from inspect import isfunction
+
+import numpy as np
+import torch
+
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
@@ -159,7 +159,6 @@ def index_to_log_onehot(x, num_classes):
     return torch.log(x_onehot.clamp(min=1e-30))
 
 def log_sum_exp_by_classes(x, slices):
-    device = x.device
     res = torch.zeros_like(x)
     for ixs in slices:
         res[:, ixs] = torch.logsumexp(x[:, ixs], dim=1, keepdim=True)

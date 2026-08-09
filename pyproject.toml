@@ -1,5 +1,11 @@
 [tool.ruff]
-line-length = 88
+# 88 is Black's default, but this codebase was not written to it: 480 lines
+# exceeded it, with a median overshoot of 8 characters. That volume drowned the
+# handful of real findings (an undefined name, a `== None` on a tensor) in noise
+# nobody was going to read, so the limit is set where the existing style
+# actually sits. The ~39 lines still over 120 are genuinely long and worth
+# breaking up when their surrounding code is next touched.
+line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
