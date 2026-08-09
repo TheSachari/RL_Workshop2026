@@ -273,15 +273,7 @@ def _manage_reinforcements(st: _LoopState) -> None:
             st.Z_1, st.dic_vehicles, st.dic_functions, v_type
         )
 
-        (
-            st.stations[v_type], r.needed, r.to_return, st.new_required_departure,
-            r.to_station, st.dic_ff, st.v_mat_to_return,
-        ) = veh_management(
-            r.disp, r.needed, r.to_return, r.lent, r.to_station,
-            st.new_required_departure, st.dic_station_distance, st.num_inter,
-            st.dic_lent, st.dic_vehicles, st.dic_functions, st.dic_ff,
-            _REINFORCEMENT_THRESHOLD[v_type], v_type, r.num_d,
-        )
+        veh_management(st, r, _REINFORCEMENT_THRESHOLD[v_type], v_type)
 
         st.dic_indic[f"{v_type}_needed"] += int(r.needed)
         st.dic_indic[f"{v_type}_disp"] = int(r.disp)

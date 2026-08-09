@@ -1362,95 +1362,69 @@ def returning(df_pc, dic_inter, num_inter, vehicle_out, dic_vehicles, dic_ff, cu
     # print("returning after", [f for f in dic_ff if dic_ff[f]==-1])
     return vehicle_out, dic_vehicles, dic_ff, current_ff_inter, planning, dic_inter
 
-def veh_management(v_disp, v_needed, v_to_return, v_lent, v_to_station, \
-    new_required_departure, dic_station_distance, num_inter, dic_lent, \
-    dic_vehicles, dic_functions, dic_ff, threshold, v_type, new_num_d):
-
+def veh_management(st, r, threshold, v_type):
     """
     Determine whether a reinforcement vehicle is needed, and update departure requirements accordingly.
 
     Parameters
     ----------
-    v_disp : int
-        Number of currently available vehicles of the target type in Z1.
-    v_needed : bool
-        Whether reinforcement is currently needed (flag).
-    v_to_return : bool
-        Whether a vehicle should be returned (flag).
-    v_lent : bool
-        Whether a vehicle is lent at destination (flag).
-    v_to_station : str
-        Destination station for the potential reinforcement.
-    new_required_departure : dict
-        Dict of required departures to be updated when reinforcements are inserted/removed.
-    dic_station_distance : dict
-        Precomputed distance ordering from Z1 to other zones.
-    num_inter : int
-        Current intervention id.
-    dic_lent : dict
-        Lent structure (mutated).
-    dic_vehicles : dict
-        Station vehicle pools (mutated).
-    dic_functions : dict
-        Vehicle_id -> functions.
-    dic_ff : dict[int, int]
-        Firefighter durations (mutated in some cases).
+    st : _LoopState
+        Loop state, read and mutated in place. Writes the per-type station
+        iterator into `st.stations[v_type]`, the vehicle awaiting return into
+        `st.v_mat_to_return`, and updates `new_required_departure` and `dic_ff`.
+    r : ReinforcementState
+        Reinforcement bookkeeping for `v_type`. `needed`, `to_return` and
+        `to_station` are written back onto it; `disp` and `lent` are read.
     threshold : int
         Minimum number of available vehicles considered sufficient.
     v_type : str
         Vehicle type ("VSAV", "FPT", "EPA").
-    new_num_d : int
-        Special departure step number used for reinforcements (e.g., 99/100/101).
 
-    Returns
-    -------
-    tuple
-        (stations_iter, v_needed, v_to_return, new_required_departure, v_to_station, dic_ff, v_mat_to_return)
+    Side Effects
+    ------------
+    Mutates `st` and `r` in place; returns nothing.
 
     Notes
     -----
     This function encodes the reinforcement policy for Z1 stations.
+
+    Previously took 15 positional parameters and returned a 7-tuple. `num_inter`
+    was never read in the body. The departure sentinel it writes under
+    (`new_num_d`, 99/100/101) is `r.num_d`, which `ReinforcementState` already
+    derives from the vehicle type, so it no longer has to be passed in
+    alongside `v_type` -- two arguments that had to agree with each other and
+    were never checked.
     """
 
-    stations_v = iter([])
-    v_mat = 0
-    # print(v_disp, v_disp, threshold, threshold, )
-    if (v_disp < threshold):
-        v_needed = True
-        v_to_return = False
-        new_required_departure[new_num_d] = [v_type]
-        stations_v = iter(dic_station_distance[v_to_station])                                                    
-        # print(num_inter, v_type, "needed for station", v_to_station)
-        
-    elif (v_disp > threshold) and v_lent: # libération du véhicule 
-        v_needed = False                 
+    st.stations[v_type] = iter([])
+    st.v_mat_to_return = 0
+
+    if (r.disp < threshold):
+        r.needed = True
+        r.to_return = False
+        st.new_required_departure[r.num_d] = [v_type]
+        st.stations[v_type] = iter(st.dic_station_distance[r.to_station])
+
+    elif (r.disp > threshold) and r.lent: # libération du véhicule
+        r.needed = False
         flag = 0
-        
-        # Mise en attente des pompiers envoyés: 
-        v_to_station = [s for s, vff in dic_lent.items() if vff and any(v_type in dic_functions[v] for v in vff)][0]
-        # print("v_to_station", v_to_station)
-        stations_v = iter([v_to_station])
-        # print(num_inter, v_type, "not needed anymore for station", v_to_station)      
-        for veh_mat, ff_mats in dic_lent[v_to_station].items(): 
-            if veh_mat in dic_vehicles[v_to_station]["available"] and v_type in dic_functions[veh_mat]:
-                # print(num_inter, v_type, veh_mat, "to return is available")
-                v_to_return = True
-                v_mat = veh_mat
-                new_required_departure[new_num_d] = [v_type]
+
+        # Mise en attente des pompiers envoyés:
+        r.to_station = [s for s, vff in st.dic_lent.items() if vff and any(v_type in st.dic_functions[v] for v in vff)][0]
+        st.stations[v_type] = iter([r.to_station])
+        for veh_mat, ff_mats in st.dic_lent[r.to_station].items():
+            if veh_mat in st.dic_vehicles[r.to_station]["available"] and v_type in st.dic_functions[veh_mat]:
+                r.to_return = True
+                st.v_mat_to_return = veh_mat
+                st.new_required_departure[r.num_d] = [v_type]
                 for ff in ff_mats:
-                    if dic_ff[ff] == 0:
-                        dic_ff[ff] = -1
-                        # print("ff", ff, "to return is available")
-                if all(dic_ff[ff] == -1 for ff in ff_mats):
-                    # print(num_inter, "all ff waiting for", v_type, veh_mat, ff_mats)
+                    if st.dic_ff[ff] == 0:
+                        st.dic_ff[ff] = -1
+                if all(st.dic_ff[ff] == -1 for ff in ff_mats):
                     flag = 1
-                # else:
-                #     print("not all ff waiting")
 
             if flag:
                 break
-
-    return stations_v, v_needed, v_to_return, new_required_departure, v_to_station, dic_ff, v_mat
             
 def cancel_departure(all_roles_found, vehicle_found, planning, current_station, \
     month, day, hour, dic_vehicles, dic_ff, v_mat):
