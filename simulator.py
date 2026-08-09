@@ -472,16 +472,8 @@ def _fill_roles(st: _LoopState) -> None:
             state, st.all_ff_waiting, ff_array, st.inter_done
         )
 
-        (
-            st.dic_indic, st.dic_lent, all_roles_found, st.vehicle_found,
-            st.planning, st.dic_vehicles, st.dic_ff, st.idx_role, st.degraded,
-        ) = step(
-            action, st.idx_role, ff_existing, st.all_ff_waiting, st.current_station,
-            st.Z_1, st.dic_lent, st.v_mat, st.dic_ff, st.fleet.VSAV.lent,
-            st.fleet.FPT.lent, st.fleet.EPA.lent, st.planning, st.month, st.day,
-            st.hour, st.num_inter, st.new_required_departure, st.num_d, st.list_v,
-            num_role, st.mandatory, st.degraded, st.team_max, all_roles_found,
-            st.vehicle_found, st.dic_vehicles, st.dic_indic, skill_lvl, st.station_lvl,
+        all_roles_found, st.vehicle_found = step(
+            st, action, ff_existing, num_role, all_roles_found, skill_lvl,
         )
 
         # Before dic_indic_old is refreshed: the reward is the delta between the

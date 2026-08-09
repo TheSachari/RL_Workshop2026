@@ -700,124 +700,96 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif):
 
     return reward
 
-def step(action, idx_role, ff_existing, all_ff_waiting, current_station, Z_1, dic_lent, \
-    v_mat, dic_ff, VSAV_lent, FPT_lent, EPA_lent, planning, month, day, hour, num_inter, new_required_departure, num_d, \
-    list_v, num_role, mandatory, degraded, team_max, all_roles_found, \
-    vehicle_found, dic_vehicles, dic_indic, skill_lvl, station_lvl):
-
+def step(st, action, ff_existing, num_role, all_roles_found, skill_lvl):
     """
     Apply a firefighter assignment action for the current role and update environment state.
 
     Parameters
     ----------
+    st : _LoopState
+        The simulation's loop state, read and mutated in place. `step` uses
+        `action_size`-independent fields only: the environment containers
+        (`dic_lent`, `dic_ff`, `dic_vehicles`, `planning`, `dic_indic`), the
+        current position in the departure (`current_station`, `v_mat`, `num_d`,
+        `list_v`, `month`, `day`, `hour`), the reinforcement flags via `fleet`,
+        and the two values it advances (`idx_role`, `degraded`).
     action : int
         Selected action index from the feasible action set.
-    idx_role : int
-        Current flattened role index (will be advanced as roles are filled).
     ff_existing : list[int]
         Candidate firefighter identifiers.
-    all_ff_waiting : bool
-        Whether the algorithm is waiting for lent firefighters to return/become available.
-    current_station : str
-        Station currently being processed in the PDD loop.
-    Z_1 : list[str]
-        List of Z1 stations (special handling for reinforcements/lending).
-    dic_lent : dict
-        Lent structure mapping Z1 station -> {vehicle_id: [firefighters]}.
-    v_mat : str
-        Vehicle/material identifier being assigned.
-    dic_ff : dict[int, int]
-        Remaining durations per firefighter (mutated when firefighters are assigned).
-    VSAV_lent, FPT_lent, EPA_lent : bool
-        Flags tracking whether reinforcements have been lent (per vehicle type).
-    planning : dict
-        Planning dictionary (mutated: available/standby lists).
-    month, day, hour : int
-        Time slot for availability updates.
-    num_inter : int
-        Current intervention id.
-    new_required_departure : dict
-        Departure dict for remaining vehicles to dispatch (mutated when failures occur).
-    num_d : int
-        Current departure step.
-    list_v : list[str]
-        List of acceptable vehicle function types for this step (OR-list).
     num_role : int
         Current role number within the vehicle.
-    mandatory : int
-        Number of mandatory roles required for the vehicle to be considered non-degraded.
-    degraded : bool
-        Current degraded status for the vehicle.
-    team_max : int
-        Max team size / role count for the vehicle.
     all_roles_found : bool
         Whether all roles were successfully assigned for the vehicle.
-    vehicle_found : bool
-        Whether a physical vehicle was successfully selected.
-    dic_vehicles : dict
-        Station vehicle pools (mutated to move vehicles between available/standby/inter).
-    dic_indic : dict
-        Indicator counters (mutated).
     skill_lvl : int
         Skill-level indicator for the chosen firefighter.
-    station_lvl : int
-        Index of the current station in the PDD search.
 
     Returns
     -------
-    tuple
-        (dic_indic, dic_lent, all_roles_found, vehicle_found, planning, dic_vehicles,
-         dic_ff, idx_role, degraded)
+    tuple[bool, bool]
+        `(all_roles_found, vehicle_found)`. Everything else this used to return
+        is now written straight back onto `st`.
 
     Side Effects
     ------------
-    Mutates multiple dictionaries in-place (planning, dic_vehicles, dic_ff, dic_lent, dic_indic).
+    Mutates `st` and, through it, the environment dictionaries it holds
+    (planning, dic_vehicles, dic_ff, dic_lent, dic_indic).
 
     Notes
     -----
     This is the core transition function for the assignment process and is used by both
     heuristic simulation and RL-driven decision-making.
+
+    It took 30 positional parameters and returned a 9-tuple, of which 25 were
+    fields of `st` that the caller unpacked only to pass straight back. That
+    made the call site eight lines of positional arguments in which swapping
+    two same-typed neighbours -- `dic_ff` for `dic_lent`, `month` for `day` --
+    would not raise anything, just quietly produce wrong results. Taking `st`
+    removes that whole class of mistake; the remaining five parameters are the
+    values that genuinely belong to this one role assignment and live nowhere
+    else.
     """
 
     if action < 79:
-        idx_role += 1
+        st.idx_role += 1
 
         ff_mat = ff_existing[action]
-        dic_indic['skill_lvl'] += skill_lvl * 8  # was normalized in state
-        
-        if all_ff_waiting and (current_station in Z_1): # pompiers à rapatrier
-            dic_lent[current_station][v_mat].remove(ff_mat)
-            dic_ff[ff_mat] = -2 # was already in standby -1
+        st.dic_indic['skill_lvl'] += skill_lvl * 8  # was normalized in state
+
+        if st.all_ff_waiting and (st.current_station in st.Z_1): # pompiers à rapatrier
+            st.dic_lent[st.current_station][st.v_mat].remove(ff_mat)
+            st.dic_ff[ff_mat] = -2 # was already in standby -1
 
         else:
-            dic_ff[ff_mat] = -1
+            st.dic_ff[ff_mat] = -1
 
-            if not (VSAV_lent or FPT_lent or EPA_lent or (current_station in Z_1)):
-                planning[current_station][month][day][hour]['available'].remove(ff_mat)
-          
-        planning[current_station][month][day][hour]['standby'].append(ff_mat)
+            lent = st.fleet.VSAV.lent or st.fleet.FPT.lent or st.fleet.EPA.lent
+            if not (lent or (st.current_station in st.Z_1)):
+                st.planning[st.current_station][st.month][st.day][st.hour]['available'].remove(ff_mat)
+
+        st.planning[st.current_station][st.month][st.day][st.hour]['standby'].append(ff_mat)
 
     else: # aucun pompier n'a les compétences requises
-        new_required_departure[num_d] = list_v # Le véhicule requis est ajouté au nouveau train
+        st.new_required_departure[st.num_d] = st.list_v # Le véhicule requis est ajouté au nouveau train
         # si le rôle est obligatoire ou que ce n'est pas le 1er véhicule
-        
-        if (num_role > mandatory) and (num_d == 1): # Si le rôle est facultatif et que c'est 
-        # le 1er véhicule 
-            if not degraded: 
-                degraded = True
+
+        if (num_role > st.mandatory) and (st.num_d == 1): # Si le rôle est facultatif et que c'est
+        # le 1er véhicule
+            if not st.degraded:
+                st.degraded = True
                 # print(v_mat, "degraded")
-            idx_role += 1
+            st.idx_role += 1
 
-        else: # Si le rôle n'est pas facultatif ou que ce n'est pas le 1er véhicule    
+        else: # Si le rôle n'est pas facultatif ou que ce n'est pas le 1er véhicule
 
-            all_roles_found, vehicle_found, planning, dic_vehicles, \
-            dic_ff = cancel_departure(all_roles_found, vehicle_found, planning, current_station, \
-                                      month, day, hour, dic_vehicles, dic_ff, v_mat)  
-            idx_role += team_max - (num_role -1) # le num_role est itéré une fois de plus au-delà du max
-            dic_indic['rupture_ff'] += 1
+            all_roles_found, st.vehicle_found, st.planning, st.dic_vehicles, \
+            st.dic_ff = cancel_departure(all_roles_found, st.vehicle_found, st.planning, st.current_station, \
+                                      st.month, st.day, st.hour, st.dic_vehicles, st.dic_ff, st.v_mat)
+            st.idx_role += st.team_max - (num_role -1) # le num_role est itéré une fois de plus au-delà du max
+            st.dic_indic['rupture_ff'] += 1
             # dic_indic['ff_skill_lvl'][v_mat] = []
 
-    return dic_indic, dic_lent, all_roles_found, vehicle_found, planning, dic_vehicles, dic_ff, idx_role, degraded
+    return all_roles_found, st.vehicle_found
 
 def get_mandatory_max(v):
     """
