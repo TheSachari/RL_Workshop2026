@@ -506,40 +506,23 @@ def load_environment(constraint_factor_veh, constraint_factor_ff, dataset, start
     ))
 
 
-def gen_state(veh_depart, idx_role, ff_array, ff_existing, dic_roles, dic_roles_skills, dic_ff, df_skills, \
-             coord_x, coord_y, month_sin, month_cos, day_sin, day_cos, hour_sin, hour_cos, info_avail, max_duration, action_size):
-
+def gen_state(st, ff_array, ff_existing, info_avail):
     """
     Build the state matrix used by the RL policy for firefighter assignment decisions.
 
     Parameters
     ----------
-    veh_depart : list[str]
-        Ordered list of requested vehicle functions/types for the current intervention.
-    idx_role : int
-        Index of the current role being assigned within the flattened role list of all vehicles.
+    st : _LoopState
+        Loop state, read only. Supplies the departure being filled
+        (`veh_depart`, `idx_role`), the role and skill tables, the incident's
+        coordinates and periodic time embeddings, `max_duration` and
+        `action_size`.
     ff_array : numpy.ndarray
         Skill matrix for candidate firefighters, typically shape (N_ff, N_skills).
     ff_existing : list[int]
         Candidate firefighter identifiers corresponding to rows of `ff_array`.
-    dic_roles : dict
-        Mapping vehicle_type -> list[str] roles required (role names).
-    dic_roles_skills : dict
-        Mapping role_name -> skill requirement vector (aligned to df_skills columns).
-    dic_ff : dict[int, int]
-        Remaining duration (minutes) per firefighter; negative/zero values indicate unavailability.
-    df_skills : pandas.DataFrame
-        Skill table used to align skill vectors and compute compatibility.
-    coord_x, coord_y : float
-        Incident coordinates.
-    month_sin, month_cos, day_sin, day_cos, hour_sin, hour_cos : float
-        Periodic time embeddings used by the generative model / environment.
     info_avail : numpy.ndarray
         Neighborhood availability features computed by `get_neighborhood_availability`.
-    max_duration : float
-        Maximum intervention duration used to normalize the current duration feature.
-    action_size : int
-        Maximum number of firefighter "slots" encoded in the state (typically 80).
 
     Returns
     -------
@@ -554,18 +537,26 @@ def gen_state(veh_depart, idx_role, ff_array, ff_existing, dic_roles, dic_roles_
     The exact layout is project-specific; downstream code assumes:
     - row 1 is a one-hot indicator of the current role (used to select a column)
     - rows 2.. include per-firefighter role compatibility (>0 means feasible)
+
+    Unlike the other functions taking `st`, this one only reads: it builds the
+    state vector and mutates nothing. It took 19 positional parameters, 16 of
+    which were `st` fields -- including six periodic time embeddings in a row
+    (`month_sin`, `month_cos`, `day_sin`, ...) whose order the call site had to
+    reproduce exactly, with a swap costing nothing but silently wrong features
+    fed to the policy. The three that remain are genuinely local to the role
+    being filled.
     """
 
     nb_roles = 37
 
     # ff skills
-    state = np.hstack(([get_roles_for_ff(veh, ff_array, dic_roles, dic_roles_skills) for veh in veh_depart])).astype(float)
+    state = np.hstack(([get_roles_for_ff(veh, ff_array, st.dic_roles, st.dic_roles_skills) for veh in st.veh_depart])).astype(float)
 
     state /= 8 # normalization, 8 skill lvls
 
 
     # filler row
-    filler = np.zeros((action_size-state.shape[0], state.shape[1])) # max 74 de base + 6 ff lent
+    filler = np.zeros((st.action_size-state.shape[0], state.shape[1])) # max 74 de base + 6 ff lent
     state = np.vstack((state, filler))
 
     # filler col
@@ -573,31 +564,27 @@ def gen_state(veh_depart, idx_role, ff_array, ff_existing, dic_roles, dic_roles_
     state = np.concatenate((state, filler), axis=1)
 
     # resp time
-    resp_time = np.array([dic_ff[f] for f in df_skills.loc[ff_existing, :].index])
-    resp_time_norm = np.where(resp_time < 0, 0.0, resp_time/max_duration) # normalization
-    # resp_time_norm = np.where(resp_time < 0, 0, 1) # à voir avec mathieu pour l'AM
-    mask_minus1 = (resp_time == -1) 
+    resp_time = np.array([st.dic_ff[f] for f in st.df_skills.loc[ff_existing, :].index])
+    resp_time_norm = np.where(resp_time < 0, 0.0, resp_time/st.max_duration) # normalization
+    mask_minus1 = (resp_time == -1)
     mask_minus2 = (resp_time == -2)
     resp_time_all = np.stack([resp_time_norm, mask_minus1, mask_minus2], axis=1)
 
-    zero_rows = np.zeros(((action_size-len(ff_existing)), resp_time_all.shape[1]))
+    zero_rows = np.zeros(((st.action_size-len(ff_existing)), resp_time_all.shape[1]))
     availability = np.vstack((resp_time_all, zero_rows))
 
     state = np.hstack((state, availability))
 
     # current role to fill
     current_role = [0]*state.shape[1]
-    current_role[idx_role] = 1  
-    # state = np.insert(state, 0, np.array(current_role), axis=0)
+    current_role[st.idx_role] = 1
     state = np.vstack((current_role, state))
 
     # rl_infos + position + time
 
-    rl_infos = np.array(info_avail + [coord_x, coord_y, month_sin, month_cos, day_sin, day_cos, hour_sin, hour_cos] + [0]*22)
-    # print("rl_infos", rl_infos)
+    rl_infos = np.array(info_avail + [st.coord_x, st.coord_y, st.month_sin, st.month_cos,
+                                      st.day_sin, st.day_cos, st.hour_sin, st.hour_cos] + [0]*22)
     state = np.vstack((rl_infos, state))
-
-    # print("state shape final", state.shape, flush=True)
 
     return state
 

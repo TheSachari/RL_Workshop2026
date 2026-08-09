@@ -425,13 +425,7 @@ def _fill_roles(st: _LoopState) -> None:
         ff_existing = _resolve_crew(st)
         ff_array = gen_ff_array(st.df_skills, st.skills_updated, ff_existing)
 
-        state = gen_state(
-            st.veh_depart, st.idx_role, ff_array, ff_existing,
-            st.dic_roles, st.dic_roles_skills, st.dic_ff, st.df_skills,
-            st.coord_x, st.coord_y, st.month_sin, st.month_cos, st.day_sin,
-            st.day_cos, st.hour_sin, st.hour_cos, info_avail,
-            st.max_duration, st.action_size,
-        )
+        state = gen_state(st, ff_array, ff_existing, info_avail)
 
         action, skill_lvl, potential_actions = st.decide(
             state, st.all_ff_waiting, ff_array, st.inter_done
