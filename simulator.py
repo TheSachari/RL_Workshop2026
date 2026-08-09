@@ -245,16 +245,7 @@ def _handle_arrivals(st: _LoopState) -> None:
         if not (r.sent and st.num_inter == r.arrival_num):
             continue
 
-        (
-            st.dic_vehicles, r.sent, r.lent, r.returning,
-            st.dic_ff, st.planning, st.dic_back, st.dic_lent, st.dic_log,
-            r.to_return,
-        ) = reinforcement_arriving(
-            st.num_inter, st.dic_vehicles, st.dic_back, st.dic_lent,
-            st.dic_ff, st.dic_log, st.planning, r.from_station, r.to_station,
-            r.sent, r.returning, r.lent, r.to_return,
-            st.month, st.day, st.hour, st.dic_start_time, v_type,
-        )
+        reinforcement_arriving(st, r, v_type)
 
 
 def _split_train(st: _LoopState) -> None:
@@ -319,16 +310,7 @@ def _return_reinforcement(st: _LoopState, ff_to_send: list) -> None:
             if not (r.to_return and st.num_d == r.num_d):
                 continue
 
-            (
-                r.from_station, r.to_station, r.arrival_num, st.dic_back,
-                st.dic_log, r.needed, r.sent, st.all_ff_waiting, st.v_waiting,
-                r.to_return, r.returning,
-            ) = reinforcement_returning(
-                st.num_inter, r.to_station, r.from_station, st.dic_log,
-                st.v_mat, st.dic_vehicles, st.dic_station_distance, st.date,
-                st.df_pc, st.idx, st.dic_back, ff_to_send, r.needed, r.sent,
-                st.all_ff_waiting, st.v_waiting, r.returning, v_type,
-            )
+            reinforcement_returning(st, r, ff_to_send, v_type)
             return
     else:
         # Return impossible, firefighters unavailable: make it available again.

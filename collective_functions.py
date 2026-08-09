@@ -1237,93 +1237,64 @@ def purge_dic_v(dic):
 
     return new_dic
 
-def reinforcement_arriving(num_inter, dic_vehicles, dic_back, dic_lent, dic_ff, dic_log, planning, v_from_station, \
-    v_to_station, v_sent, v_returning, v_lent, v_to_return, month, day, hour, dic_start_time, v_type):
-    
+def reinforcement_arriving(st, r, v_type):
     """
     Handle the arrival of a lent reinforcement vehicle and update station availability.
 
     Parameters
     ----------
-    num_inter : int
-        Current intervention id (event index).
-    dic_vehicles : dict
-        Station vehicle pools (mutated).
-    dic_back : dict
-        Bookkeeping structure tracking return trips for reinforcements (mutated).
-    dic_lent : dict
-        Lent structure mapping destination station -> {vehicle_id: [firefighters]} (mutated).
-    dic_ff : dict[int, int]
-        Remaining duration per firefighter (mutated).
-    dic_log : dict
-        Log structure tracking reinforcement events (mutated).
-    planning : dict
-        Planning availability structure (mutated).
-    v_from_station : str
-        Origin station of the reinforcement.
-    v_to_station : str
-        Destination station.
-    v_sent : bool
-        Whether the reinforcement is currently in transit.
-    v_returning : bool
-        Whether the reinforcement is returning.
-    v_lent : bool
-        Whether the vehicle is considered lent at destination.
-    v_to_return : bool
-        Whether the vehicle should return to origin after use.
-    month, day, hour : int
-        Time slot for planning updates.
-    dic_start_time : dict
-        Map vehicle_id -> (month, day, hour) start time.
+    st : _LoopState
+        Loop state, read and mutated in place (`dic_vehicles`, `dic_back`,
+        `dic_lent`, `dic_ff`, `dic_log`, `planning`, and the current time slot).
+    r : ReinforcementState
+        Reinforcement bookkeeping for `v_type`. `sent`, `lent`, `returning` and
+        `to_return` are written back onto it.
     v_type : str
         Vehicle type ("VSAV", "FPT", "EPA") for logging and routing.
 
-    Returns
-    -------
-    tuple
-        Updated (dic_vehicles, v_sent, v_lent, v_returning, dic_ff, planning, dic_back,
-        dic_lent, dic_log, v_to_return)
-
     Side Effects
     ------------
-    Mutates multiple dictionaries in-place to reflect the reinforcement arrival.
+    Mutates `st`, `r` and the environment dictionaries in place; returns nothing.
+
+    Notes
+    -----
+    Previously took 18 positional parameters and returned a 10-tuple whose
+    element order (`v_sent`, `v_lent`, `v_returning`) did not match the order
+    the fields are declared in `ReinforcementState` (`sent`, `lent`, ...,
+    `returning`). The call site happened to line them up correctly, but nothing
+    enforced it -- that is precisely the mistake this signature makes
+    impossible. `num_inter` was never read in the body.
     """
 
-    veh_mat = dic_vehicles[v_from_station][v_type + "_sent"][0]
-    dic_vehicles[v_to_station]["available"].append(veh_mat)
-    dic_vehicles[v_from_station][v_type + "_sent"] = [] 
-    v_sent -= 1 
+    veh_mat = st.dic_vehicles[r.from_station][v_type + "_sent"][0]
+    st.dic_vehicles[r.to_station]["available"].append(veh_mat)
+    st.dic_vehicles[r.from_station][v_type + "_sent"] = []
+    r.sent -= 1
 
-    start_month, start_day, start_hour = dic_start_time[veh_mat]
-    
-    if v_returning: 
-        v_lent -= 1
-        v_returning = False
-        for f in dic_back[veh_mat]:
-            dic_ff[f] = 0
-            if (f in planning[v_to_station][month][day][hour]["planned"]) and \
-            (f not in planning[v_to_station][month][day][hour]["available"]):
-                planning[v_to_station][month][day][hour]["available"].append(f)
+    start_month, start_day, start_hour = st.dic_start_time[veh_mat]
 
-            if (f not in planning[v_to_station][start_month][start_day][start_hour]["available"]):
-                planning[v_to_station][start_month][start_day][start_hour]["available"].append(f)
+    if r.returning:
+        r.lent -= 1
+        r.returning = False
+        for f in st.dic_back[veh_mat]:
+            st.dic_ff[f] = 0
+            if (f in st.planning[r.to_station][st.month][st.day][st.hour]["planned"]) and \
+            (f not in st.planning[r.to_station][st.month][st.day][st.hour]["available"]):
+                st.planning[r.to_station][st.month][st.day][st.hour]["available"].append(f)
 
-        
-        # print(num_inter, v_type, veh_mat, dic_back[veh_mat], "sent back from", v_from_station, "to", v_to_station, "has arrived")
-        del dic_back[veh_mat]  
-        del dic_lent[v_from_station][veh_mat]   
-        del dic_log[veh_mat]
+            if (f not in st.planning[r.to_station][start_month][start_day][start_hour]["available"]):
+                st.planning[r.to_station][start_month][start_day][start_hour]["available"].append(f)
 
-    else: 
-        v_lent += 1
-        for f in dic_lent[v_to_station][veh_mat]:
-            dic_ff[f] = 0
+        del st.dic_back[veh_mat]
+        del st.dic_lent[r.from_station][veh_mat]
+        del st.dic_log[veh_mat]
 
-        # print(num_inter, v_type, veh_mat, dic_lent[v_to_station][veh_mat], "sent from", v_from_station, "to", v_to_station, "has arrived")
+    else:
+        r.lent += 1
+        for f in st.dic_lent[r.to_station][veh_mat]:
+            st.dic_ff[f] = 0
 
-    v_to_return = False
-
-    return dic_vehicles, v_sent, v_lent, v_returning, dic_ff, planning, dic_back, dic_lent, dic_log, v_to_return
+    r.to_return = False
 
 def returning(df_pc, dic_inter, num_inter, vehicle_out, dic_vehicles, dic_ff, current_ff_inter, planning, month, day, hour):
 
@@ -1539,75 +1510,50 @@ def cancel_departure(all_roles_found, vehicle_found, planning, current_station, 
 
     return all_roles_found, vehicle_found, planning, dic_vehicles, dic_ff
 
-def reinforcement_returning(num_inter, v_to_station, v_from_station, dic_log, v_mat, dic_vehicles, \
-    dic_station_distance, date, df_pc, idx, dic_back, ff_to_send, v_needed, \
-    v_sent, all_ff_waiting, v_waiting, v_returning, v_type):
-    
+def reinforcement_returning(st, r, ff_to_send, v_type):
     """
     Send a lent vehicle back to its origin station and schedule its arrival.
 
     Parameters
     ----------
-    num_inter : int
-        Current intervention id.
-    v_to_station : str
-        Current destination station (where vehicle is lent).
-    v_from_station : str
-        Origin station.
-    dic_log : dict
-        Log structure updated with return metadata.
-    v_mat : str
-        Vehicle/material id returning.
-    dic_vehicles : dict
-        Station vehicle pools (mutated).
-    dic_station_distance : dict
-        Distance ordering used to schedule arrival.
-    date : pandas.Timestamp
-        Current event timestamp.
-    df_pc : pandas.DataFrame
-        Event stream (used to infer future arrival index).
-    idx : int
-        Current event row index.
-    dic_back : dict
-        Structure tracking return trips (mutated).
+    st : _LoopState
+        Loop state, read and mutated in place (`dic_vehicles`, `dic_back`,
+        `dic_log`, `all_ff_waiting`, `v_waiting`).
+    r : ReinforcementState
+        Reinforcement bookkeeping for `v_type`. The station pair is swapped on
+        it, and `arrival_num`, `needed`, `sent`, `to_return` and `returning`
+        are written back.
     ff_to_send : list[int]
         Firefighters on the returning vehicle.
-    v_needed : bool
-        Reinforcement-needed flag.
-    v_sent : bool
-        Vehicle-sent flag.
-    all_ff_waiting : bool
-        Waiting flag.
-    v_waiting : bool
-        Vehicle waiting flag.
-    v_returning : bool
-        Returning flag.
     v_type : str
-        Vehicle type.
+        Vehicle type (VSAV, FPT or EPA).
 
-    Returns
-    -------
-    tuple
-        Updated set of routing flags and structures, including next arrival intervention number.
+    Side Effects
+    ------------
+    Mutates `st` and `r` in place; returns nothing.
+
+    Notes
+    -----
+    Previously took 18 positional parameters and returned an 11-tuple. The
+    station swap below is order-dependent -- `from_station` takes the old
+    `to_station`, and the new `to_station` comes from `dic_log` *before*
+    `dic_log[v_mat]` is overwritten -- so the sequence is kept exactly as it
+    was. `num_inter` was never read in the body.
     """
 
-    v_from_station = v_to_station
-    v_to_station = dic_log[v_mat]
-    dic_vehicles[v_from_station][v_type+"_sent"].append(v_mat)
-    arrival_time = date + timedelta(minutes = dic_station_distance[v_from_station][v_to_station] + 20)
-    arrival_num = df_pc.loc[(df_pc.index >= idx) & (df_pc["date"] >= arrival_time), "num_inter"].iloc[0]
-    # print(num_inter, v_type, v_mat, ff_to_send, "sent back from", v_from_station, "will arrive at", arrival_num, "to", v_to_station)
-    dic_back[v_mat] = ff_to_send
-    dic_log[v_mat] = v_from_station
-    # print("reinforcement_returning", dic_log)
-    v_needed = False
-    v_sent += 1
-    all_ff_waiting = False
-    v_waiting = False
-    v_to_return = False
-    v_returning = True
-
-    return v_from_station, v_to_station, arrival_num, dic_back, dic_log, v_needed, v_sent, all_ff_waiting, v_waiting, v_to_return, v_returning
+    r.from_station = r.to_station
+    r.to_station = st.dic_log[st.v_mat]
+    st.dic_vehicles[r.from_station][v_type+"_sent"].append(st.v_mat)
+    arrival_time = st.date + timedelta(minutes = st.dic_station_distance[r.from_station][r.to_station] + 20)
+    r.arrival_num = st.df_pc.loc[(st.df_pc.index >= st.idx) & (st.df_pc["date"] >= arrival_time), "num_inter"].iloc[0]
+    st.dic_back[st.v_mat] = ff_to_send
+    st.dic_log[st.v_mat] = r.from_station
+    r.needed = False
+    r.sent += 1
+    st.all_ff_waiting = False
+    st.v_waiting = False
+    r.to_return = False
+    r.returning = True
 
 def reinforcement_sending(st, r, ff_to_send, v_type):
     """
