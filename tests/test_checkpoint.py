@@ -362,13 +362,27 @@ class TestCompatibility:
 
 
 class TestDurability:
-    def test_previous_checkpoint_is_kept(self, tmp_path):
+    def test_each_save_replaces_the_last(self, tmp_path):
+        """One checkpoint on disk, by default: saves overwrite each other."""
         first = save_to(tmp_path, num_inter=10000)
         second = save_to(tmp_path, num_inter=20000)
         assert first == second  # same live path
         assert ckpt.load(second)["num_inter"] == 20000
-        # The rotation is what survives a kill mid-write.
+        assert not (tmp_path / "agent.ckpt.prev").exists()
+        assert [p.name for p in tmp_path.iterdir()] == ["agent.ckpt"]
+
+    def test_previous_checkpoint_is_kept_when_asked(self, tmp_path):
+        save_to(tmp_path, num_inter=10000, keep=2)
+        second = save_to(tmp_path, num_inter=20000, keep=2)
+        assert ckpt.load(second)["num_inter"] == 20000
         assert ckpt.load(tmp_path / "agent.ckpt.prev")["num_inter"] == 10000
+
+    def test_dropping_to_one_removes_a_stale_prev(self, tmp_path):
+        save_to(tmp_path, num_inter=10000, keep=2)
+        save_to(tmp_path, num_inter=20000, keep=2)
+        assert (tmp_path / "agent.ckpt.prev").exists()
+        save_to(tmp_path, num_inter=30000)  # back to the default
+        assert not (tmp_path / "agent.ckpt.prev").exists()
 
     def test_no_temp_file_is_left_behind(self, tmp_path):
         save_to(tmp_path)

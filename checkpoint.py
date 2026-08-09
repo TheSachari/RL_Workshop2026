@@ -258,13 +258,17 @@ def save(
     dic_saved_skills: dict,
     args: Any,
     include_buffer: bool = True,
-    keep: int = 2,
+    keep: int = 1,
 ) -> Path:
-    """Write a resumable checkpoint atomically, keeping the last `keep` files.
+    """Write a resumable checkpoint atomically, keeping `keep` files.
 
     The temp-file-then-`os.replace` dance is the point: `os.replace` is atomic
     on POSIX, so a kill during the (multi-second, buffer-sized) write leaves the
-    previous checkpoint whole instead of truncating the live one.
+    existing checkpoint whole instead of truncating it -- the partial write is
+    discarded with the temp file.
+
+    `keep=1` means one checkpoint on disk, each save overwriting the last. Pass
+    `keep=2` to also retain the previous one as `<name>.prev`.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,10 +309,11 @@ def save(
         f.flush()
         os.fsync(f.fileno())
 
-    # Rotate *before* the replace: the live file still holds the previous
-    # checkpoint at this point, which is exactly what `.prev` should capture.
-    # Rotating afterwards would link `.prev` to the inode the new file now
-    # occupies, leaving two names for one version and no fallback at all.
+    # `keep=1` (the default) leaves exactly one checkpoint on disk: each save
+    # replaces the last. Durability does not depend on keeping the previous one
+    # -- the payload is written to a temp file and `os.replace` is atomic on
+    # POSIX, so a process killed mid-write leaves the existing checkpoint whole
+    # and the partial file is the one discarded.
     _rotate(path, keep)
     os.replace(tmp, path)
 
@@ -316,10 +321,20 @@ def save(
 
 
 def _rotate(path: Path, keep: int) -> None:
-    """Point `.prev` at the checkpoint currently live, before it is replaced."""
-    if keep < 2 or not path.exists():
-        return
+    """Point `.prev` at the checkpoint currently live, before it is replaced.
+
+    Only runs when `keep >= 2`. At the default of 1 there is no `.prev`, and any
+    file left by an earlier multi-checkpoint setting is removed so the directory
+    does not keep a stale copy around forever.
+    """
     prev = path.with_suffix(path.suffix + ".prev")
+
+    if keep < 2:
+        prev.unlink(missing_ok=True)
+        return
+
+    if not path.exists():
+        return
     try:
         if prev.exists():
             prev.unlink()
