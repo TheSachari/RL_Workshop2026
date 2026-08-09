@@ -137,7 +137,7 @@ def apply_logic(potential_actions, potential_skills, is_best):
     Notes
     -----
     This function does not apply the action; it only selects it. The action is later
-    applied by `step` (environment mutation) or `lazy_step` (indicator-only update).
+    applied by `step`, which mutates the environment.
     """
 
     if is_best:
@@ -699,58 +699,6 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif):
 
 
     return reward
-
-def lazy_step(action, num_d, num_role, mandatory, degraded, new_dic_indic, skill_lvl):
-
-    """
-    Update indicator counters for an action without mutating environment structures.
-
-    Parameters
-    ----------
-    action : int
-        Selected action index.
-    num_d : int
-        Departure step number.
-    num_role : int
-        Role index within the current vehicle team.
-    mandatory : int
-        Number of mandatory roles for the current vehicle type.
-    degraded : bool
-        Whether the current vehicle is already degraded.
-    new_dic_indic : dict
-        Indicator dictionary to update (copied by caller).
-    skill_lvl : int
-        Skill mismatch/gradation level for the chosen firefighter.
-
-    Returns
-    -------
-    dict
-        Updated indicator dictionary.
-
-    Notes
-    -----
-    This is useful for computing rewards or simulating outcomes without performing
-    the full in-place assignment (`step`), e.g., during action evaluation.
-    """
-
-    if action < 79:
-        
-        new_dic_indic['skill_lvl'] += skill_lvl * 8  # was normalized in state
-        
-    else: # aucun pompier n'a les compétences requises
-
-        
-        if (num_role > mandatory) and (num_d == 1): # Si le rôle est facultatif et que c'est 
-        # le 1er véhicule 
-
-            degraded = True
-
-        else: # Si le rôle n'est pas facultatif ou que ce n'est pas le 1er véhicule    
-
-            new_dic_indic['rupture_ff'] += 1
-
-    return new_dic_indic
-
 
 def step(action, idx_role, ff_existing, all_ff_waiting, current_station, Z_1, dic_lent, \
     v_mat, dic_ff, VSAV_lent, FPT_lent, EPA_lent, planning, month, day, hour, num_inter, new_required_departure, num_d, \
