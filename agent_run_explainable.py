@@ -34,6 +34,7 @@ Notes
 
 import argparse
 import json
+import os
 import pickle
 import random
 
@@ -225,6 +226,36 @@ if __name__ == "__main__":
     def on_state_ready(st):
         live["st"] = st
 
+    metrics_path = resolve(args.save_metrics_as + ".pkl", PLOTS)
+    curves_path = resolve(args.save_metrics_as + "_curves.pkl", PLOTS)
+
+    def save_metrics(num_inter):
+        """Write the run's metrics, atomically, so an interrupted run keeps them.
+
+        `dic_indic` keeps its own file and its exact previous shape — a bare
+        dict of the 21 counters — because that is what the plotting code and the
+        heuristic baseline already read.
+
+        `reward_evo` and `dic_saved_skills` were tracked for the whole run and
+        then dropped on the floor: the reward curve and the rare-skill
+        explainability counts only ever existed in memory, and a run that did
+        not reach its final line left nothing behind. They go in a second file
+        alongside, with the intervention they were written at.
+        """
+        PLOTS.mkdir(parents=True, exist_ok=True)
+        for path, payload in (
+            (metrics_path, env.dic_indic),
+            (curves_path, {"num_inter": num_inter,
+                           "reward_evo": reward_evo,
+                           "dic_saved_skills": dic_saved_skills}),
+        ):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "wb") as f:
+                pickle.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+
     def on_return(num_inter):
         """Runs on every RETURN event — not on the 100-tick logging schedule."""
         if args.eps_start > 0 and eps_update and num_inter % eps_update == 0:
@@ -248,8 +279,10 @@ if __name__ == "__main__":
                 args=args,
                 include_buffer=not args.no_save_buffer,
             )
+            save_metrics(num_inter)
             print(num_inter, "Agent saved as", args.model_name,
-                  "| checkpoint", ckpt_path.name, flush=True)
+                  "| checkpoint", ckpt_path.name,
+                  "| metrics", metrics_path.name, flush=True)
 
     run_simulation(env, fleet, decide, action_size=action_size,
                    on_row=on_row, on_action=on_action,
@@ -260,8 +293,5 @@ if __name__ == "__main__":
     dic_indic = env.dic_indic
     print("Simulation done")
 
-    PLOTS.mkdir(parents=True, exist_ok=True)
-    metrics_path = resolve(args.save_metrics_as + ".pkl", PLOTS)
-    with open(metrics_path, "wb") as f:
-        pickle.dump(dic_indic, f)
-    print("Metrics saved to", metrics_path)
+    save_metrics(live["st"].num_inter if live["st"] is not None else None)
+    print("Metrics saved to", metrics_path, "and", curves_path)
