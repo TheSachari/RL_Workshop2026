@@ -227,13 +227,20 @@ class Dataset:
         Returns
         -------
         List[int]
-            Category sizes. Returns an empty list if `X_cat` is None.
+            One cardinality per categorical column, in column order. Returns an
+            empty list if `X_cat` is None.
 
         Notes
         -----
-        This calls `get_category_sizes` from elsewhere in the codebase (if available).
+        The cardinality of a column is its number of *distinct* values, not its
+        maximum value plus one: callers use these sizes both as the one-hot
+        width (`np.sum(K)`) and as `num_classes`, so a column whose codes are
+        sparse must not be padded out to unused categories.
         """
-        return [] if self.X_cat is None else get_category_sizes(self.X_cat[part])
+        if self.X_cat is None:
+            return []
+        X = self.X_cat[part]
+        return [len(np.unique(X[:, i])) for i in range(X.shape[1])]
 
 
 def prepare_fast_dataloader(D: Dataset, split: str, batch_size: int):
