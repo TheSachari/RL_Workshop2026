@@ -123,6 +123,63 @@ class TestRareSkillCounterfactual:
         assert dl.records == []
 
 
+class TestSkillsOfInterest:
+    """Restricting which skills count as worth reporting.
+
+    "Rare" is one threshold fixed when the dataset was built, and at that
+    cut-off the rule matched 78% of the test year -- it does not separate a
+    skill held by 79 firefighters from one held by three.
+    """
+
+    def test_a_skill_outside_the_set_does_not_trigger_the_rule(self, tmp_path):
+        dl = log(tmp_path, rate=0.0, margin=0.0, skills_of_interest={90})
+        dl.consider(**base_call(
+            dic_rare_skills={0: [], 1: [32]},   # common skill
+            upcoming_skills=np.array([32]),
+        ))
+        assert dl.records == []
+
+    def test_a_skill_inside_the_set_still_triggers_it(self, tmp_path):
+        dl = log(tmp_path, rate=0.0, margin=0.0, skills_of_interest={90})
+        dl.consider(**base_call(
+            dic_rare_skills={0: [], 1: [90]},
+            upcoming_skills=np.array([90]),
+        ))
+        assert dl.records[0]["rare_skills_given_up"] == {1: [90]}
+
+    def test_none_means_every_rare_skill(self, tmp_path):
+        dl = log(tmp_path, rate=0.0, margin=0.0, skills_of_interest=None)
+        dl.consider(**base_call(
+            dic_rare_skills={0: [], 1: [32]},
+            upcoming_skills=np.array([32]),
+        ))
+        assert len(dl.records) == 1
+
+    def test_the_set_is_reported(self, tmp_path):
+        dl = log(tmp_path, skills_of_interest={90, 59})
+        assert dl.summary()["skills_of_interest"] == [59, 90]
+
+
+class TestRarestSkills:
+    def test_ranks_by_how_often_a_skill_is_given_up(self, tmp_path):
+        dl = log(tmp_path, rate=1.0, margin=0.0)
+        # skill 5 appears three times, skill 7 once.
+        for skills in ([5], [5], [5], [7]):
+            dl.consider(**base_call(
+                dic_rare_skills={0: [], 1: skills},
+                upcoming_skills=np.array(skills),
+            ))
+        path = dl.flush()
+
+        from decision_log import rarest_skills
+        assert rarest_skills(path, percentile=50) == {7}
+
+    def test_an_empty_log_yields_an_empty_set(self, tmp_path):
+        from decision_log import rarest_skills
+        path = log(tmp_path).flush()
+        assert rarest_skills(path) == set()
+
+
 class TestSampling:
     def test_close_decisions_are_kept_without_sampling(self, tmp_path):
         dl = log(tmp_path, rate=0.0, margin=0.5)

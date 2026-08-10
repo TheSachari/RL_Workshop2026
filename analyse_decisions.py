@@ -63,8 +63,15 @@ def report_coverage(summary):
     print(f"  genuine choices     : {seen - forced}  ({pct(seen - forced, seen)})")
     print(f"  recorded            : {summary['recorded']}")
     if summary.get("dropped_over_cap"):
-        print(f"  dropped over cap    : {summary['dropped_over_cap']}"
-              "   (raise --max_records to keep them)")
+        print(f"  dropped over cap    : {summary['dropped_over_cap']}")
+        print("  TRUNCATED -- the cap was reached, so these records are the")
+        print("  earliest eligible decisions, not a sample of them. Proportions")
+        print("  below are biased towards the start of the run. Re-run with a")
+        print("  lower --decision_log_skill_rate or a higher cap.")
+    of_interest = summary.get("skills_of_interest")
+    if of_interest is not None:
+        print(f"  rare-skill rule limited to {len(of_interest)} skills: {of_interest}")
+        print("  Counts below cover only those; they are not run-wide totals.")
     print("  A forced decision has one feasible firefighter: the assignment is")
     print("  made by the skill constraints, not by the policy.")
 

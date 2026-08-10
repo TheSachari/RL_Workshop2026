@@ -62,7 +62,17 @@ def get_all_planed_ff(planning, month, day, hour, df_stations):
 
 def get_rare_skills_from_planed_ff(date, month, day, hour, planning, df_stations, df_skills,
                                    rarity, cache=None):
-    """Which skills are rare among the firefighters on duty at this hour.
+    """Which skills are scarce among the firefighters on duty at this hour.
+
+    Scarce means *held by few of them*, not *held by none*. The test excludes
+    zero deliberately: on a typical 262-strong duty roster, 50 of the 134 skills
+    have no holder at all, and counting those as rare made the flag fire on 87%
+    of skills. A skill nobody on duty holds cannot be preserved or spent by an
+    assignment -- there is no firefighter carrying it to choose between -- so it
+    describes a gap in the roster, not a trade-off the agent can make.
+
+    Excluding them is what gives `rarity` its meaning back: with the zeros in,
+    even `rarity 5` flagged 61% of skills; with them out, `rarity 10` flags 31%.
 
     `cache` keys on (calendar day, month, day, hour), which is exact rather than
     an approximation: the crew comes from `planning[station][month][day][hour]`,
@@ -81,7 +91,7 @@ def get_rare_skills_from_planed_ff(date, month, day, hour, planning, df_stations
     df_skills_filtered = df_skills.loc[array_of_mats]
     updated_skills_filtered = update_skills(df_skills_filtered, date)
     all_current_ff_skills = np.count_nonzero(updated_skills_filtered, axis=0)
-    result = np.where(all_current_ff_skills < rarity)
+    result = np.where((all_current_ff_skills > 0) & (all_current_ff_skills < rarity))
 
     if cache is not None:
         cache[key] = result

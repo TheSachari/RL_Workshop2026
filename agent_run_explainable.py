@@ -44,7 +44,7 @@ import torch
 import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
 from collective_functions import DEFAULT_SEED, compute_reward, load_environment
-from decision_log import DecisionLog
+from decision_log import DecisionLog, rarest_skills
 from explainability import get_dic_rare_skills, get_related_rows_in_time
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
@@ -76,6 +76,9 @@ if __name__ == "__main__":
     parser.add_argument("--decision_log", type=str, default=None, help="Record per-decision explanations to this file in Plots/ (eval runs)")
     parser.add_argument("--decision_log_rate", type=float, default=0.01, help="Sampling rate for decisions that are neither close nor skill-relevant")
     parser.add_argument("--decision_log_margin", type=float, default=0.5, help="Q-value gap below which a decision counts as close")
+    parser.add_argument("--decision_log_rarest", type=float, default=None, help="Restrict the rare-skill rule to the rarest N%% of skills, ranked from --decision_log_from")
+    parser.add_argument("--decision_log_from", type=str, default=None, help="Existing log to rank skill rarity from (required by --decision_log_rarest)")
+    parser.add_argument("--decision_log_max", type=int, default=200000, help="Stop collecting past this many records")
     parser.add_argument("--decision_log_quantiles", action='store_true', help="Also store the per-action return distribution (larger file)")
 
     args = parser.parse_args()
@@ -149,8 +152,8 @@ if __name__ == "__main__":
     SVG_MODEL.mkdir(parents=True, exist_ok=True)
 
     # Mutable bits the callbacks share across calls.
-    # Eval mode starts at 0, but the decay's max(0.05, ...) floor then lifts it
-    # to 0.05 on the first tick. Preserved as-is: changing it changes results.
+    # Eval starts at 0 and must stay there: see `on_return`, where the decay is
+    # gated on training so its 0.05 floor cannot lift it back off zero.
     rl = {"eps": args.eps_start if args.train else 0.0, "d": 1,
           "compute": False, "old_state": None, "reward": 0.0, "loss": 0,
           "score": 0.0, "action_num": 0}
@@ -181,11 +184,26 @@ if __name__ == "__main__":
     # you as the weights move.
     decision_log = None
     if args.decision_log:
+        skills_of_interest = None
+        if args.decision_log_rarest is not None:
+            if not args.decision_log_from:
+                raise SystemExit(
+                    "--decision_log_rarest needs --decision_log_from: rarity is "
+                    "ranked from the skills an earlier log actually saw."
+                )
+            skills_of_interest = rarest_skills(
+                resolve(args.decision_log_from, PLOTS), args.decision_log_rarest
+            )
+            print(f"Rare-skill rule restricted to the rarest "
+                  f"{args.decision_log_rarest}%: {sorted(skills_of_interest)}", flush=True)
+
         decision_log = DecisionLog(
             resolve(args.decision_log, PLOTS),
             rate=args.decision_log_rate,
             margin=args.decision_log_margin,
+            skills_of_interest=skills_of_interest,
             keep_quantiles=args.decision_log_quantiles,
+            max_records=args.decision_log_max,
         )
         print("Decision log ->", decision_log.path, flush=True)
 
@@ -295,7 +313,13 @@ if __name__ == "__main__":
 
     def on_return(num_inter):
         """Runs on every RETURN event — not on the 100-tick logging schedule."""
-        if args.eps_start > 0 and eps_update and num_inter % eps_update == 0:
+        # Training only. In eval `rl["eps"]` is 0, but this branch used to run
+        # anyway -- `args.eps_start` keeps its 1.0 default whether or not
+        # --train was passed -- and `max(0.05, ...)` then lifted epsilon from 0
+        # to 0.05 on the first tick. A greedy evaluation was quietly taking a
+        # random action 5% of the time, which both moves its metrics and puts
+        # unexplainable choices in the decision log.
+        if args.train and args.eps_start > 0 and eps_update and num_inter % eps_update == 0:
             rl["eps"] = max(0.05, rl["eps"] * 0.99 ** rl["d"])
             rl["d"] += 1
 

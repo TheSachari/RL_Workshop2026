@@ -210,7 +210,7 @@ since the replayed leap days differ.
 python explainability.py --dataset df_pc_fake_10y_prob_p12.pkl \
   --from_dir environment --merge_into df_pc_fake_10y_prob_p12.pkl \
   --save_as df_pc_fake_10y_rare_skills_merged.pkl \
-  --save_rare_as df_pc_fake_10y_rare_skills.pkl --rarity 80
+  --save_rare_as df_pc_fake_10y_rare_skills.pkl --rarity 10
 ```
 
 ~50 min for ten years, ~5 min for one. Same again for the test stream:
@@ -219,7 +219,7 @@ python explainability.py --dataset df_pc_fake_10y_prob_p12.pkl \
 python explainability.py --dataset df_pc_fake_test_prob_p12.pkl \
   --from_dir environment --merge_into df_pc_fake_test_prob_p12.pkl \
   --save_as df_pc_fake_test_rare_skills_merged.pkl \
-  --save_rare_as df_pc_fake_test_rare_skills.pkl --rarity 80
+  --save_rare_as df_pc_fake_test_rare_skills.pkl --rarity 10
 ```
 
 **This step is mandatory before training.** The agent unpacks 20 values per
@@ -228,7 +228,7 @@ carries 19. Skipping it fails on the first row with a tuple-unpacking error.
 
 | parameter | value | why |
 |---|---|---|
-| `--rarity` | 80 | A skill is "rare" at a given hour when fewer than 80 of the firefighters then on duty hold it. Lower flags almost nothing; higher flags nearly everything and the signal stops discriminating. |
+| `--rarity` | 10 | A skill is "rare" at a given hour when **at least one but fewer than 10** of the firefighters then on duty hold it. The lower bound matters: on a typical 262-strong roster, 50 of the 134 skills have no holder at all, and counting those as rare made the flag fire on 87% of skills at `--rarity 80` — and still 61% at `--rarity 5`. Excluding them, 10 flags ~32% and 5 flags ~24%. A skill nobody on duty holds is a gap in the roster, not a trade-off an assignment can make. |
 | `--from_dir` | `environment` | Where `--dataset` lives. Defaults to `sampled`, which is right for a raw sample but not for a generated stream. |
 | `--merge_into` | same file | The stream that carries the skills. Rare skills are computed on departures only; the merge puts the RETURN rows back with empty arrays. Defaults to the *real* stream, so it must be set explicitly when working on a synthetic one. |
 

@@ -53,6 +53,15 @@ class DecisionLog:
     rate :
         Probability of keeping a decision that is neither close nor
         skill-relevant. 0 disables the random sample.
+    skills_of_interest :
+        Restrict the rare-skill rule to these skill ids, or None for all of
+        them. "Rare" is a threshold set when the dataset was built (`--rarity
+        80`: fewer than 80 firefighters on duty hold the skill), and at that
+        cut-off the rule fires on most decisions -- 78% of the test year --
+        because it lumps together skills held by 79 people and skills held by
+        three. Restricting it to the genuinely scarce ones is what makes a
+        given-up skill worth reporting. `rarest_skills` computes such a set
+        from a previous log.
     margin :
         Q-value gap below which a decision counts as close. Expressed in reward
         units, so it is comparable to the tariffs in the reward weights.
@@ -80,6 +89,7 @@ class DecisionLog:
         *,
         rate: float = 0.01,
         margin: float = 0.5,
+        skills_of_interest=None,
         keep_quantiles: bool = False,
         max_records: int = 200_000,
         seed: int = 12345,
@@ -87,6 +97,9 @@ class DecisionLog:
         self.path = Path(path)
         self.rate = rate
         self.margin = margin
+        self.skills_of_interest = (
+            None if skills_of_interest is None else set(int(s) for s in skills_of_interest)
+        )
         self.keep_quantiles = keep_quantiles
         self.max_records = max_records
         self._rng = np.random.default_rng(seed)
@@ -135,6 +148,8 @@ class DecisionLog:
         # Which rare skills would each alternative have brought, and which of
         # those does the chosen firefighter not carry?
         upcoming = set(int(s) for s in np.asarray(upcoming_skills).ravel())
+        if self.skills_of_interest is not None:
+            upcoming &= self.skills_of_interest
         chosen_rare = set(int(s) for s in dic_rare_skills.get(action, ()))
         at_stake = {}
         for alt in feasible:
@@ -192,6 +207,13 @@ class DecisionLog:
             "dropped_over_cap": self.dropped,
             "rate": self.rate,
             "margin": self.margin,
+            "skills_of_interest": (
+                None if self.skills_of_interest is None else sorted(self.skills_of_interest)
+            ),
+            # True once the cap bit: the records are then the *earliest*
+            # eligible decisions, not a sample of them, and any rate computed
+            # from them is biased towards the start of the run.
+            "truncated": self.dropped > 0,
         }
 
     def flush(self) -> Path:
@@ -203,6 +225,35 @@ class DecisionLog:
             pickle.dump(payload, f)
         tmp.replace(self.path)
         return self.path
+
+
+def rarest_skills(log_path, percentile: float = 5.0) -> set[int]:
+    """The least-often-encountered skills in an existing log, as a set of ids.
+
+    Counts how often each skill appeared as given up, and returns the bottom
+    `percentile` by that count. Feed the result to a later run's
+    `skills_of_interest` so its rare-skill rule fires only on the skills that
+    are actually scarce.
+
+    Frequency in the log, not the roster, is the right ranking here: a skill
+    that never comes up in a decision cannot explain one, however few people
+    hold it.
+    """
+    with open(log_path, "rb") as f:
+        payload = pickle.load(f)
+
+    counts: dict[int, int] = {}
+    for record in payload["records"]:
+        for skills in record.get("rare_skills_given_up", {}).values():
+            for skill in skills:
+                counts[int(skill)] = counts.get(int(skill), 0) + 1
+
+    if not counts:
+        return set()
+
+    ranked = sorted(counts.items(), key=lambda kv: kv[1])
+    keep = max(1, int(len(ranked) * percentile / 100))
+    return {skill for skill, _ in ranked[:keep]}
 
 
 def _ff_id(ff_existing, action):
