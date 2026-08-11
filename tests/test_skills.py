@@ -4,9 +4,18 @@ These decide which firefighter can fill which role, so they drive the assignment
 the whole simulation is built around.
 """
 
-import numpy as np
+import gc
 
-from collective_functions import extract_skills, get_role_from_skills, get_skill_array
+import numpy as np
+import pandas as pd
+
+from collective_functions import (
+    _SKILL_WINDOW_CACHE,
+    extract_skills,
+    get_role_from_skills,
+    get_skill_array,
+    update_skills,
+)
 
 
 class TestGetRoleFromSkills:
@@ -146,3 +155,66 @@ class TestExtractSkills:
         _, _, grade, sup = extract_skills("COD1 + GRADE(SGT) > x")
         assert grade == "E(SGT"   # should be "SGT"
         assert sup == ">"
+
+
+class TestSkillWindowCache:
+    """The window cache must speed up repeat lookups without retaining tables.
+
+    Both halves matter and they pull against each other. Keying on `id()` alone
+    is unsound -- a collected temporary's address gets reused, and the next
+    table of the same shape would read back another one's windows. Fixing that
+    by storing the table itself leaks: `explainability.crew_skill_counts` builds
+    a row-filtered view per scope, twice, and a year of evaluation touches ~60k
+    scopes, so the cache pinned gigabytes of dead views and the run died of it.
+
+    A weak reference satisfies both: dead entries cannot pass as hits, and
+    nothing is kept alive.
+    """
+
+    @staticmethod
+    def table(n_ff=40, n_skills=6):
+        start, end = pd.Timestamp("2018-01-01"), pd.Timestamp("2030-01-01")
+        columns = pd.MultiIndex.from_product(
+            [[f"skill{i}" for i in range(n_skills)], ["Début", "Fin"]]
+        )
+        return pd.DataFrame(
+            [[start, end] * n_skills for _ in range(n_ff)],
+            index=range(n_ff), columns=columns,
+        )
+
+    def test_temporary_views_are_not_retained(self):
+        """The regression: one entry after 200 throwaway views, not 200."""
+        df = self.table()
+        date = pd.Timestamp("2020-06-15")
+        _SKILL_WINDOW_CACHE.clear()
+
+        update_skills(df, date)                     # the long-lived table
+        for i in range(200):
+            update_skills(df.iloc[i % 20:(i % 20) + 10], date)
+        gc.collect()
+
+        assert len(_SKILL_WINDOW_CACHE) == 1
+
+    def test_a_live_table_is_still_served_from_the_cache(self):
+        df = self.table()
+        date = pd.Timestamp("2020-06-15")
+        _SKILL_WINDOW_CACHE.clear()
+
+        first = update_skills(df, date)
+        assert len(_SKILL_WINDOW_CACHE) == 1
+        second = update_skills(df, date)
+        assert np.array_equal(first, second)
+        assert len(_SKILL_WINDOW_CACHE) == 1        # served, not recomputed
+
+    def test_same_shaped_tables_do_not_share_windows(self):
+        """What the identity check is for: equal shapes, different content."""
+        date = pd.Timestamp("2020-06-15")
+        _SKILL_WINDOW_CACHE.clear()
+
+        valid = self.table(n_ff=4, n_skills=2)
+        expired = self.table(n_ff=4, n_skills=2)
+        # Same shape, but these windows closed before the reference date.
+        expired.loc[:, :] = pd.Timestamp("2000-01-01")
+
+        assert update_skills(valid, date).sum() == 8      # all valid
+        assert update_skills(expired, date).sum() == 0    # none valid

@@ -19,6 +19,7 @@ pure/functional interface.
 import pickle
 import random
 import re
+import weakref
 from datetime import timedelta
 
 import numpy as np
@@ -32,8 +33,9 @@ from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F4
 DEFAULT_SEED = 42
 
 # Skill validity windows, split out of the skills table once per table. Keyed by
-# `id(df_skills)` with the shape stored alongside as a guard -- see
-# `_skill_windows`. A run holds one or two tables, so this stays tiny.
+# `id(df_skills)` and holding a *weak* reference to it, so a recycled id cannot
+# be mistaken for a hit and per-decision views are not pinned for the whole run
+# -- see `_skill_windows`.
 _SKILL_WINDOW_CACHE = {}
 
 def get_skills_from_role(df_roles, role):
@@ -1742,18 +1744,28 @@ def _skill_windows(df_skills):
     `update_skills` cheap: the split is per-table, while the comparison against
     a date is per-event.
 
-    Cached on the table's identity *and* shape. Identity alone is not safe here
-    -- `explainability.get_rare_skills_from_planed_ff` passes a row-filtered
-    view, and CPython reuses the id of a garbage-collected temporary -- so the
-    shape is checked before a hit is trusted, and the entry is dropped if it
-    does not match.
+    Cached on the table's identity, held **weakly**.
+
+    Identity alone is not safe: callers build row-filtered views per decision
+    (`explainability.crew_skill_counts` does it twice per scope), and once such
+    a temporary is collected CPython is free to hand its address to the next
+    one. A shape check does not catch that -- two rosters of the same size
+    collide on it -- and the cache would then return another table's windows,
+    silently.
+
+    A weak reference fixes that without the leak a strong one causes. Keeping
+    the table in the entry would pin every per-decision view for the whole run:
+    a year of evaluation touches ~60k distinct scopes, so the cache would grow
+    without bound instead of holding the handful of long-lived tables it is
+    meant for. With a weakref, a dead entry cannot be mistaken for a live hit
+    (the referent reads back as None) and temporaries are freed as usual.
 
     NaT becomes NaN, and every comparison against NaN is False, which
     reproduces the `fillna(False)` the pandas version ended with.
     """
     key = id(df_skills)
     hit = _SKILL_WINDOW_CACHE.get(key)
-    if hit is not None and hit[0] == df_skills.shape:
+    if hit is not None and hit[0]() is df_skills:
         return hit[1], hit[2]
 
     level0 = df_skills.columns.get_level_values(0)
@@ -1772,7 +1784,16 @@ def _skill_windows(df_skills):
     values = df_skills.to_numpy(dtype="datetime64[ns]").astype("float64")
     starts, ends = values[:, start_cols], values[:, end_cols]
 
-    _SKILL_WINDOW_CACHE[key] = (df_skills.shape, starts, ends)
+    # The weakref callback drops the entry when the table dies, so the dict
+    # cannot accumulate keys for tables that no longer exist -- the id would be
+    # reused anyway, and a stale entry is what the identity check exists to
+    # prevent. Views that cannot be weak-referenced simply go uncached.
+    try:
+        reference = weakref.ref(df_skills, lambda _, k=key: _SKILL_WINDOW_CACHE.pop(k, None))
+    except TypeError:
+        return starts, ends
+
+    _SKILL_WINDOW_CACHE[key] = (reference, starts, ends)
     return starts, ends
 
 

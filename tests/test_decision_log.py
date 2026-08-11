@@ -262,3 +262,68 @@ class TestOutput:
             explain={"random": True, "q_values": None, "quantiles": None}
         ))
         assert "exploratory" in describe(dl.records[0])
+
+
+class TestScopedRarity:
+    """The station-scoped fields, recorded alongside the window-based ones.
+
+    They answer a different question: `upcoming` says a skill is about to be
+    needed, `irreversible` says spending it here cannot be undone because the
+    station is its sole holder and no neighbour can cover it.
+    """
+
+    def test_the_scoped_fields_are_recorded(self, tmp_path):
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call(
+            local_rare_skills=np.array([7, 12, 40]),
+            irreversible_rare_skills=np.array([7, 40]),
+        ))
+        rec = dl.records[0]
+        assert rec["rare_skills_local"] == [7, 12, 40]
+        assert rec["rare_skills_irreversible"] == [7, 40]
+
+    def test_it_reports_what_the_chosen_firefighter_commits(self, tmp_path):
+        """The chosen firefighter's skills, intersected with the irreversible set."""
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call(
+            dic_rare_skills={0: [7, 12], 1: []},
+            local_rare_skills=np.array([7, 12, 40]),
+            irreversible_rare_skills=np.array([7, 40]),
+        ))
+        # 7 is both carried and irreversible; 12 is local but coverable nearby.
+        assert dl.records[0]["irreversible_spent"] == [7]
+
+    def test_nothing_is_committed_when_the_choice_carries_no_scarce_skill(self, tmp_path):
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call(
+            dic_rare_skills={0: [3], 1: []},
+            irreversible_rare_skills=np.array([7, 40]),
+        ))
+        assert dl.records[0]["irreversible_spent"] == []
+
+    def test_the_fields_default_to_empty_when_not_supplied(self, tmp_path):
+        """The caller may omit them -- training runs do not compute scoped rarity."""
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call())
+        rec = dl.records[0]
+        assert rec["rare_skills_local"] == []
+        assert rec["rare_skills_irreversible"] == []
+        assert rec["irreversible_spent"] == []
+
+    def test_describe_mentions_an_irreversible_commitment(self, tmp_path):
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call(
+            dic_rare_skills={0: [7], 1: []},
+            irreversible_rare_skills=np.array([7]),
+        ))
+        text = describe(dl.records[0])
+        assert "7" in text
+        assert "sole holder" in text
+
+    def test_describe_survives_a_record_from_an_older_log(self, tmp_path):
+        """Logs written before these fields existed must still render."""
+        dl = log(tmp_path, rate=1.0)
+        dl.consider(**base_call())
+        record = dict(dl.records[0])
+        del record["irreversible_spent"]
+        assert "sole holder" not in describe(record)

@@ -45,10 +45,17 @@ import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
 from collective_functions import DEFAULT_SEED, compute_reward, load_environment
 from decision_log import DecisionLog, rarest_skills
-from explainability import get_dic_rare_skills, get_related_rows_in_time
+from explainability import (
+    get_dic_rare_skills,
+    get_related_rows_in_time,
+    rare_skills_for_step,
+)
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
 from simulator import run_simulation
+
+# Shared empty result, for decisions where scoped rarity is not computed.
+_EMPTY = np.array([], dtype=int)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent parameters")
@@ -160,6 +167,9 @@ if __name__ == "__main__":
     reward_evo = []
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
+    # Scoped rarity is constant within an hour for a given (station,
+    # neighbourhood), so every role of every vehicle there shares one entry.
+    scoped_cache = {}
     eps_update = (args.end - args.start) // 23  # ~23 steps to reach 5% of eps
 
     # Applied after `load_environment` so the checkpoint's containers overwrite
@@ -217,6 +227,17 @@ if __name__ == "__main__":
         """Agent choice, learning from the previous transition first."""
         dic_rare_skills = get_dic_rare_skills(upcoming["skills"], ff_array)
 
+        # Rarity scoped to the station that would lose this firefighter, which
+        # the event stream's 20th column cannot express: it holds one array per
+        # event, so every station of a departure got the same answer. Pooling
+        # all 34 stations misses 89% of the skills that are scarce where the
+        # choice is actually made.
+        scoped = {"local": _EMPTY, "irreversible": _EMPTY}
+        if decision_log is not None and live["st"] is not None:
+            scoped["local"], scoped["irreversible"] = rare_skills_for_step(
+                live["st"], n_following=args.top_n, cache=scoped_cache
+            )
+
         # `compute` guards the first action, where there is no old_state yet.
         if rl["compute"] and args.train:
             l0 = agent.step(rl["old_state"], rl["action"], rl["reward"], state, inter_done)
@@ -251,6 +272,8 @@ if __name__ == "__main__":
                 ff_existing=st.ff_existing, dic_rare_skills=dic_rare_skills,
                 upcoming_skills=upcoming["skills"], skill_lvl=skill_lvl,
                 explain=explain,
+                local_rare_skills=scoped["local"],
+                irreversible_rare_skills=scoped["irreversible"],
             )
 
         rl["action"] = action

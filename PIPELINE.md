@@ -229,8 +229,43 @@ carries 19. Skipping it fails on the first row with a tuple-unpacking error.
 | parameter | value | why |
 |---|---|---|
 | `--rarity` | 10 | A skill is "rare" at a given hour when **at least one but fewer than 10** of the firefighters then on duty hold it. The lower bound matters: on a typical 262-strong roster, 50 of the 134 skills have no holder at all, and counting those as rare made the flag fire on 87% of skills at `--rarity 80` — and still 61% at `--rarity 5`. Excluding them, 10 flags ~32% and 5 flags ~24%. A skill nobody on duty holds is a gap in the roster, not a trade-off an assignment can make. |
+| `--top_k` | unset | Keep at most the K rarest skills of the hour, **ties included**, among those `--rarity` already admitted. A holder count is not comparable across hours — a day roster and a night one make "fewer than 10" mean different things — so the threshold alone lets the number of flagged skills swing with the shift; a rank does not. Ties are admitted whole (asking 20 may return 23) because cutting through equal counts would have to order them by skill index, and membership would then flip between neighbouring hours on nothing real — noise that the two-hour window in `get_related_rows_in_time` spreads and `rare_skills_given_up` reports per decision. Bites only where the threshold is loose: at `--rarity 80`, `--top_k 20` takes ~54% of skills down to ~15%; at `--rarity 10` it is inert. |
 | `--from_dir` | `environment` | Where `--dataset` lives. Defaults to `sampled`, which is right for a raw sample but not for a generated stream. |
 | `--merge_into` | same file | The stream that carries the skills. Rare skills are computed on departures only; the merge puts the RETURN rows back with empty arrays. Defaults to the *real* stream, so it must be set explicitly when working on a synthetic one. |
+
+### Scoped rarity (decision-time, no pipeline step)
+
+The column above pools all 34 stations, but the agent picks a firefighter from
+one station's crew. Measured on the reference year, the pooled count **misses
+89%** of the skills that are scarce where the choice is made: a station holds
+~39 of the 134 skills with a median crew of 17, so a skill carried by 40 people
+department-wide can still be its only one.
+
+`explainability.rare_skills_for_step(st)` computes the two scoped levels at
+decision time instead — no precompute, because the scope depends on the step:
+`current_station` is known only once the departure has walked down the PDD, and
+a reinforcement's sender is chosen when it is sent.
+
+| level | rule | why |
+|---|---|---|
+| `LOCAL_RARITY` | 2 | The **sole holder** on this station's shift. Assigning them to a subordinate role removes the skill for the shift; from two holders on, one remains. The only threshold here resting on a mechanism rather than a calibration — and the one `modelisation.tex` already describes ("le seul détenteur"). Flags ~9.9 skills per decision, 26% of those the station holds. |
+| `NEIGH_RARITY` | 6 | Also scarce across the stations called next, so no neighbour can cover the gap. Splits the sole-holder skills ~48/52 into irreversible and absorbable — the other half are locally scarce but abundant next door, and the deployment order handles them. |
+
+Both are **absolute, not ranked**. A `top_k` here would flatten the signal: the
+number of irreversible skills *should* rise when the neighbourhood is thin.
+Absolute thresholds proved stable anyway — 50%/47%/49% irreversible across a
+2.2x range of neighbourhood sizes — because a scarce skill's holder count does
+not grow with the pool.
+
+The neighbourhood is always that of the station **losing** the firefighter,
+ordered by the PDD when there is one and by distance otherwise. Reinforcements
+take the second path: the crew leaves the sending station for the travel time
+plus 20 minutes with no local incident, and senders (the 11 Z2/Z3 stations) have
+thinner rosters than first-due stations (13 vs 17) and thinner neighbourhoods
+(80 vs 116). Same thresholds, same split (47% vs 48%).
+
+Recorded per decision in the log as `rare_skills_local`,
+`rare_skills_irreversible` and `irreversible_spent`.
 
 Check the width:
 

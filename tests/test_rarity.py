@@ -42,12 +42,13 @@ def skills_table(holders_per_skill, n_ff=10):
     return pd.DataFrame(rows, index=range(n_ff), columns=columns)
 
 
-def flagged(holders_per_skill, rarity, n_ff=10):
+def flagged(holders_per_skill, rarity, n_ff=10, top_k=None):
     df_skills = skills_table(holders_per_skill, n_ff)
     planning = {STATION: {HOUR[0]: {HOUR[1]: {HOUR[2]: {"planned": list(range(n_ff))}}}}}
     df_stations = pd.DataFrame({"Nom": [STATION]})
     result = get_rare_skills_from_planed_ff(
-        pd.Timestamp("2020-06-15"), *HOUR, planning, df_stations, df_skills, rarity
+        pd.Timestamp("2020-06-15"), *HOUR, planning, df_stations, df_skills, rarity,
+        top_k=top_k,
     )
     return set(result[0].tolist())
 
@@ -80,6 +81,69 @@ class TestUpperBound:
     ])
     def test_the_threshold_selects_progressively(self, rarity, expected):
         assert flagged([1, 3, 7, 0], rarity=rarity) == expected
+
+
+class TestTopK:
+    """The rank cut, which bounds how many skills an hour can flag.
+
+    A count is not comparable across hours -- a day roster and a night roster
+    make "fewer than N holders" mean different things -- so the threshold alone
+    lets the number of flagged skills swing with the shift. The rank bounds it.
+    """
+
+    def test_only_the_k_rarest_survive(self):
+        assert flagged([1, 2, 3, 4], rarity=10, top_k=2) == {0, 1}
+
+    def test_the_threshold_still_applies_under_the_rank(self):
+        """Asking for 3 does not promote a skill the threshold excluded."""
+        # 2 holders passes; 8 and 9 are over `rarity`; 0 has nobody.
+        assert flagged([2, 8, 9, 0], rarity=5, top_k=3) == {0}
+
+    def test_fewer_eligible_than_k_returns_them_all(self):
+        assert flagged([1, 2], rarity=10, top_k=20) == {0, 1}
+
+    def test_none_keeps_the_threshold_alone(self):
+        assert flagged([1, 2, 3, 4], rarity=10, top_k=None) == {0, 1, 2, 3}
+
+
+class TestTies:
+    """Ties are admitted whole, so the cut never splits equal counts.
+
+    Taking exactly `top_k` would separate skills on equal counts by index order.
+    Two skills held by 12 people are equally rare, and letting one in while the
+    other stays out makes membership flip between neighbouring hours on nothing
+    real -- noise that `get_related_rows_in_time` then spreads over a two-hour
+    window and `rare_skills_given_up` reports per decision.
+    """
+
+    def test_a_tie_at_the_cutoff_is_kept_whole(self):
+        """k=2, but three skills hold 2: all three stay rather than two of them."""
+        assert flagged([2, 2, 2, 7], rarity=10, top_k=2) == {0, 1, 2}
+
+    def test_the_band_widens_but_does_not_reach_past_the_cutoff_count(self):
+        """Admitting a tie adds only skills *at* the cutoff, not the next ones up.
+
+        k=3 and four skills hold 1: all four come in. Skill 4, at 5 holders, is
+        strictly commoner than the cutoff and stays out even though the returned
+        set is already over k.
+        """
+        assert flagged([1, 1, 1, 1, 5], rarity=10, top_k=3) == {0, 1, 2, 3}
+
+    def test_membership_does_not_depend_on_skill_order(self):
+        """The same multiset of counts, permuted, flags the same positions."""
+        # Counts 3, 1, 3 are eligible; 9 is over `rarity`. k=2 cuts at 3, so the
+        # pair of 3s comes in whole alongside the 1.
+        assert flagged([3, 1, 3, 9], rarity=8, top_k=2) == {0, 1, 2}
+        assert flagged([3, 3, 9, 1], rarity=8, top_k=2) == {0, 1, 3}
+
+    def test_a_count_that_barely_moves_does_not_reshuffle_the_others(self):
+        """The instability the tie rule exists to prevent, as a before/after."""
+        before = flagged([4, 4, 4, 4, 9], rarity=8, top_k=3)
+        after = flagged([4, 4, 4, 5, 9], rarity=8, top_k=3)
+        assert before == {0, 1, 2, 3}
+        # One holder joins skill 3, which leaves the band on its own count. The
+        # other three are untouched rather than reshuffled around the cutoff.
+        assert after == {0, 1, 2}
 
 
 class TestCache:

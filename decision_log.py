@@ -125,8 +125,18 @@ class DecisionLog:
         upcoming_skills,
         skill_lvl,
         explain: Optional[dict] = None,
+        local_rare_skills=None,
+        irreversible_rare_skills=None,
     ) -> None:
-        """Record this decision if it carries information; count it either way."""
+        """Record this decision if it carries information; count it either way.
+
+        `local_rare_skills` and `irreversible_rare_skills` are scoped to the
+        station that would lose the firefighter: skills held by exactly one of
+        its crew, and the subset of those the neighbouring stations cannot
+        cover. They are recorded alongside the window-based `upcoming_skills`
+        rather than replacing it -- one says a skill is about to be needed, the
+        other says spending it here cannot be undone.
+        """
         self.seen += 1
 
         feasible = [int(a) for a in potential_actions]
@@ -160,6 +170,12 @@ class DecisionLog:
             if given_up:
                 at_stake[alt] = given_up
 
+        local_rare = _as_id_set(local_rare_skills)
+        irreversible = _as_id_set(irreversible_rare_skills)
+        # Which of the chosen firefighter's skills nobody nearby can replace.
+        chosen_skills = set(int(s) for s in dic_rare_skills.get(action, ()))
+        spent_irreversibly = sorted(chosen_skills & irreversible)
+
         close = margin_value is not None and abs(margin_value) < self.margin
         skill_relevant = bool(at_stake)
         sampled = self.rate > 0 and self._rng.random() < self.rate
@@ -189,6 +205,11 @@ class DecisionLog:
             "rare_skills_upcoming": sorted(upcoming),
             "rare_skills_chosen": sorted(chosen_rare),
             "rare_skills_given_up": at_stake,
+            # Scoped to the station losing the firefighter, unlike the three
+            # above, which come from the event stream's department-wide column.
+            "rare_skills_local": sorted(local_rare),
+            "rare_skills_irreversible": sorted(irreversible),
+            "irreversible_spent": spent_irreversibly,
             "why": {"close": close, "skill": skill_relevant, "sampled": sampled},
         }
 
@@ -256,6 +277,13 @@ def rarest_skills(log_path, percentile: float = 5.0) -> set[int]:
     return {skill for skill, _ in ranked[:keep]}
 
 
+def _as_id_set(skills) -> set:
+    """Skill ids as a set, tolerating None and any array-like."""
+    if skills is None:
+        return set()
+    return set(int(s) for s in np.asarray(skills).ravel())
+
+
 def _ff_id(ff_existing, action):
     """Map an action index back to the firefighter it designates."""
     try:
@@ -294,5 +322,12 @@ def describe(record: dict) -> str:
             )
     elif record["rare_skills_upcoming"]:
         lines.append("  no rare skill was given up by this choice")
+
+    # Older logs predate the scoped fields, so read them defensively.
+    if record.get("irreversible_spent"):
+        lines.append(
+            f"  committed skill(s) {record['irreversible_spent']}: sole holder at "
+            "this station, and no neighbouring station can cover it"
+        )
 
     return "\n".join(lines)
