@@ -24,6 +24,26 @@ import numpy as np
 import torch
 
 
+def _compress_state(state):
+    """Store a state as float16, halving what the buffer costs to keep.
+
+    A state is 3280 features -- mostly binary skill indicators, the rest
+    normalised coordinates and sin/cos time encodings -- so fp16's ~3 decimal
+    digits lose nothing that matters here, while fp32 costs 13 KB per state and
+    a transition keeps two of them. At buffer_size 100000 that is the difference
+    between 2.7 GB and 1.4 GB, which is what decides how many replicates fit on
+    one machine.
+
+    Only storage is affected: `learn`/`learn_per` rebuild float32 tensors with
+    `torch.as_tensor(..., dtype=torch.float32)`, so gradients never see fp16.
+    Rewards and returns stay float32 throughout -- `calc_multistep_return`
+    accumulates 64 discounted terms, where fp16 would round.
+    """
+    if isinstance(state, torch.Tensor):
+        return state.detach().to(torch.float16).cpu().numpy()
+    return np.asarray(state, dtype=np.float16)
+
+
 class DT_ReplayBuffer:
     """
     Trajectory replay buffer for Decision Transformer training with padding and masks.
@@ -564,8 +584,15 @@ class N_Steps_Prioritized_ReplayBuffer():
 
         self.n_step_buffer.append((state, action, reward, next_state, done))
         if len(self.n_step_buffer) == self.n_steps:
-            state, action, n_steps_reward, next_state, done = self.calc_multistep_return(self.n_step_buffer) 
-            e = self.experience(state, action, reward, next_state, done)
+            state, action, n_steps_reward, next_state, done = self.calc_multistep_return(self.n_step_buffer)
+            # `n_steps_reward`, not `reward`: the latter is the loop variable
+            # from the caller's last step, so storing it discarded the n-step
+            # return this buffer exists to compute and made `n_steps` affect
+            # only the discount exponent in `learn_per`, never the target.
+            # fp16 on the two states only -- they are all but a few of the bytes.
+            e = self.experience(
+                _compress_state(state), action, n_steps_reward, _compress_state(next_state), done
+            )
             priority = self.sum_tree.priority_max if self.memory else 1.0 # gives max priority if buffer is not empty else 1
             
             if len(self.memory) < self.buffer_size:
