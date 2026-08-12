@@ -655,10 +655,39 @@ def get_start_hour(df, num_inter):
         (month, day, hour) for the first departure event of `num_inter`.
     """
 
-    idx = df[df["num_inter"] == num_inter].index[0]
-    date = df["date"].loc[idx]
+    return _start_hours(df)[num_inter]
 
-    return date.month, date.day, date.hour
+
+_START_HOUR_CACHE = {}
+
+
+def _start_hours(df):
+    """`num_inter` -> (month, day, hour) of that intervention's first row.
+
+    `get_start_hour` used to scan the whole event stream on every call --
+    `df[df["num_inter"] == n]` over 127,392 rows, once per returning vehicle.
+    That is 2.8 s of a 4,000-intervention run for 4,003 lookups, and the cost
+    grows with the stream length rather than the window simulated. Each
+    `num_inter` has exactly two rows (departure, then RETURN) and the index is
+    a monotonic RangeIndex, so "first occurrence" is what `.index[0]` returned.
+
+    Keyed by object identity behind a weakref, so a stream that goes out of
+    scope does not pin its table here.
+    """
+    key = id(df)
+    cached = _START_HOUR_CACHE.get(key)
+    if cached is not None and cached[0]() is df:
+        return cached[1]
+
+    first = df.groupby("num_inter", sort=False)["date"].first()
+    table = {n: (d.month, d.day, d.hour) for n, d in first.items()}
+
+    try:
+        ref = weakref.ref(df, lambda _, k=key: _START_HOUR_CACHE.pop(k, None))
+    except TypeError:
+        return table              # un-weakref-able view: correct, just uncached
+    _START_HOUR_CACHE[key] = (ref, table)
+    return table
 
 def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif):
     """
@@ -855,20 +884,36 @@ def create_dic_roles(df_vehicles_history):
         Mapping vehicle_type -> list of role names in the order they should be assigned.
     """
 
-    df_vehicles_history["Fonction"] = df_vehicles_history["Fonction"].fillna("")
+    # A vehicle is named at three levels of a taxonomy -- "Type" (68 values,
+    # never missing), "Fonction" (73) and "Type Matériel" (62, the finest) --
+    # and `dic_roles` is keyed under all three so a lookup succeeds whichever
+    # name the caller has. The finest levels are simply not always recorded:
+    # the 14,216 rows without a "Type Matériel" are exactly those without a
+    # "Fonction" (common vehicles -- VSAV, FPT, CCF -- identified by "Type"
+    # alone).
+    #
+    # All three are blanked, not just "Fonction", so the `!= ""` guard below
+    # actually skips the missing names it was written for. Previously they
+    # arrived as NaN, `NaN != ""` let them through, and the NaN keys were
+    # deleted again further down -- via `isnan` at the end of this function.
+    # Filling them up front makes that cleanup unnecessary and, because no key
+    # can then depend on NaN object identity, lets the loop iterate raw columns
+    # instead of building a Series per row.
+    for column in ("Type Matériel", "Type", "Fonction"):
+        df_vehicles_history[column] = df_vehicles_history[column].fillna("")
     dic_replace = {"XCOMPL":"COMPL"}
     df_vehicles_history["Fonction"] = df_vehicles_history["Fonction"].replace(dic_replace)
-    
+
     dic_roles = {}
 
-    for _, row in df_vehicles_history.iterrows():
+    # Now that no key can be NaN, iterating the raw columns is equivalent to
+    # `iterrows` and ~20x cheaper: `iterrows` built a Series per row, and its
+    # 459k scalar `row[...]` lookups were 6.6 s of a 15 s 4k-intervention run.
+    columns = ["Type Matériel", "Type", "Fonction",
+               "Ordre Fonction Occupee", "Fonction Occupee"]
+    for tm, t, f, ofo, fo in df_vehicles_history[columns].itertuples(index=False, name=None):
 
-        tm = row["Type Matériel"]
-        t = row["Type"]
-        f = row["Fonction"]
-        ofo = row["Ordre Fonction Occupee"]
-        fo = row["Fonction Occupee"]
-        
+
         if (tm != ""):
             if tm not in dic_roles:
                 dic_roles[tm] = {ofo:fo}
@@ -956,6 +1001,47 @@ def update_dict(dic, k):
         dic[k] = 1
     return dic
 
+_ROLE_MASK_CACHE = {}
+
+
+def _role_masks(required_skills):
+    """The three broadcast-ready comparisons of a role's constraint vector.
+
+    `get_role_from_skills` recomputed `required_skills == -1/1/0` on every call
+    -- 90,342 times per 4,000 interventions -- although the constraint vectors
+    come from `dic_roles_skills`, which is built once in
+    `generate_dic_roles_skills` and never mutated afterwards. There are only 116
+    of them, so the same handful of comparisons was being redone tens of
+    thousands of times.
+
+    Keyed by array identity, which is safe here precisely because the vectors
+    are immutable in practice; the arrays are marked read-only on first use so
+    a future in-place edit fails loudly instead of silently serving stale masks.
+    Held behind a weakref so a discarded role table does not stay alive.
+    """
+    key = id(required_skills)
+    cached = _ROLE_MASK_CACHE.get(key)
+    if cached is not None and cached[0]() is required_skills:
+        return cached[1]
+
+    masks = ((required_skills == -1)[:, np.newaxis, :],
+             (required_skills == 1)[:, np.newaxis, :],
+             (required_skills == 0)[:, np.newaxis, :])
+
+    try:
+        required_skills.flags.writeable = False
+    except (AttributeError, ValueError):
+        return masks              # a view we may not lock: correct, just uncached
+
+    try:
+        ref = weakref.ref(required_skills,
+                          lambda _, k=key: _ROLE_MASK_CACHE.pop(k, None))
+    except TypeError:
+        return masks
+    _ROLE_MASK_CACHE[key] = (ref, masks)
+    return masks
+
+
 def get_role_from_skills(required_skills, ff_array):
 
     """
@@ -978,20 +1064,18 @@ def get_role_from_skills(required_skills, ff_array):
         - skill_lvl: compatibility/gradation level for that assignment
     """
 
-    matches_minus_one = (required_skills == -1)[:, np.newaxis, :]  # Reshape pour broadcast
-    matches_one = (required_skills == 1)[:, np.newaxis, :]
-    matches_zero_or_any = (required_skills == 0)[:, np.newaxis, :]
-    
-    conditions_met = ((matches_minus_one & (ff_array == 0)[np.newaxis, :, :]) | 
-                      (matches_one & (ff_array == 1)[np.newaxis, :, :]) | 
+    matches_minus_one, matches_one, matches_zero_or_any = _role_masks(required_skills)
+
+    conditions_met = ((matches_minus_one & (ff_array == 0)[np.newaxis, :, :]) |
+                      (matches_one & (ff_array == 1)[np.newaxis, :, :]) |
                       matches_zero_or_any)
-    
+
     conditions_met = np.all(conditions_met, axis=2)
-    
+
     first_valid_index = np.argmax(conditions_met, axis=0) +1
-    
+
     first_valid_index[~np.any(conditions_met, axis=0)] = 0
-    
+
     return first_valid_index
 
 def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills):
