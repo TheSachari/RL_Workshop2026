@@ -571,7 +571,11 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     state = np.concatenate((state, filler), axis=1)
 
     # resp time
-    resp_time = np.array([st.dic_ff[f] for f in st.df_skills.loc[ff_existing, :].index])
+    # `ff_existing` directly, not `df_skills.loc[ff_existing, :].index`: that
+    # reindexed a 268-column frame to read back the very labels it was given,
+    # at 168 us against 0.15 us, on every decision. The two are the same list --
+    # `.loc` with a label list preserves order and repeats duplicates.
+    resp_time = np.array([st.dic_ff[f] for f in ff_existing])
     resp_time_norm = np.where(resp_time < 0, 0.0, resp_time/st.max_duration) # normalization
     mask_minus1 = (resp_time == -1)
     mask_minus2 = (resp_time == -2)
