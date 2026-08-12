@@ -1836,33 +1836,55 @@ def update_skills(df_skills, date_reference):
     77% of a training run's wall time, dwarfing the network's own forward and
     backward passes. The comparison is the same one, done once over two arrays.
 
-    Memoised per calendar day, which is exact rather than an approximation:
-    validity windows start and end at midnight, so every reference within the
-    same day yields the same matrix. The simulation loop recomputes this
-    whenever the event stream's date advances -- 8018 times per 4000
-    interventions, a third of the loop's time -- against one distinct value per
-    day.
+    Memoised per calendar day. All 26,097 `Début`/`Fin` bounds fall exactly on
+    midnight, so validity cannot change *within* a day and one entry per day is
+    exact. The simulation loop recomputes this whenever the event stream's date
+    advances -- 8018 times per 4000 interventions, a third of the loop's time --
+    against one distinct value per day.
+
+    Caching per day must not be confused with *evaluating* at midnight, which
+    is what an earlier version did and which is wrong at the closing bound: a
+    skill whose `Fin` is day D is expired for any reference inside D (the
+    original compares `Fin >= date_reference`, false from 00:00:01 onward), yet
+    evaluating at D 00:00 makes `Fin >= D` true and keeps it valid for the whole
+    day. That silently granted skills the thesis code treats as expired. The
+    comparison below therefore uses the exact `date_reference`, and the closing
+    bound is strict whenever the reference is past midnight -- reproducing
+    `Fin >= date_reference` while still varying only across days.
 
     The returned array is shared and marked read-only, so a caller that needs
     to write must copy first. Every caller today either fancy-indexes it (which
     copies) or reduces it.
     """
     starts, ends = _skill_windows(df_skills)
-    day = pd.Timestamp(date_reference).normalize()
+    stamp = pd.Timestamp(date_reference)
+    day = stamp.normalize()
+    # A reference at exactly midnight and one later the same day disagree on
+    # windows closing that day, so the flag belongs in the key, not just in the
+    # comparison. Midnight references are rare here; this costs at most one
+    # extra entry per day.
+    slot = (day, stamp != day)
 
     key = id(df_skills)
     cached = _SKILL_VALID_CACHE.get(key)
     if cached is not None and cached[0]() is df_skills:
-        hit = cached[1].get(day)
+        hit = cached[1].get(slot)
         if hit is not None:
             return hit
     else:
         cached = None
 
+    # Bounds are midnight-aligned, so `starts <= stamp` is unchanged by
+    # flooring, but `ends >= stamp` is not: at any time past midnight a window
+    # closing today has already lapsed. Compare against the day and drop
+    # equality on the closing bound to get exactly that, with no dependence on
+    # the time of day beyond this flag.
     reference = np.datetime64(day, "ns").astype("float64")
+    intraday = slot[1]
     # int8: the result is 0/1, and at 3343x134 the dtype is the difference
     # between 3.6 MB and 0.45 MB per cached day.
-    valid = ((starts <= reference) & (ends >= reference)).astype(np.int8)
+    open_ = ends > reference if intraday else ends >= reference
+    valid = ((starts <= reference) & open_).astype(np.int8)
     valid.flags.writeable = False
 
     if cached is None:
@@ -1876,7 +1898,7 @@ def update_skills(df_skills, date_reference):
         _SKILL_VALID_CACHE[key] = cached
 
     days = cached[1]
-    days[day] = valid
+    days[slot] = valid
     while len(days) > _SKILL_VALID_MAX_DAYS:
         days.pop(next(iter(days)))    # dicts keep insertion order: drop oldest
     return valid

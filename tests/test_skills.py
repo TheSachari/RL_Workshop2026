@@ -251,11 +251,20 @@ class TestValidityCache:
         evening = update_skills(df, pd.Timestamp("2020-06-15 23:59"))
         assert morning is evening
 
-    def test_a_window_closing_overnight_is_still_seen(self):
-        """The bug a coarser cache would cause: the day boundary must matter."""
+    def test_a_window_lapses_from_the_first_instant_of_its_closing_day(self):
+        """`Fin` is an inclusive instant, not an inclusive day.
+
+        The original compares `Fin >= date_reference`, so a window closing on
+        day D is valid at D 00:00 and expired at every later instant of D. This
+        test previously asserted 12 at 23:00 -- it was encoding a bug in the
+        memoisation, which evaluated the comparison at midnight and so kept
+        such skills alive for the whole day. Checked against the thesis
+        implementation directly.
+        """
         df = self.table("2018-01-01", "2020-06-15")
         _SKILL_VALID_CACHE.clear()
-        assert update_skills(df, pd.Timestamp("2020-06-15 23:00")).sum() == 12
+        assert update_skills(df, pd.Timestamp("2020-06-15 00:00")).sum() == 12
+        assert update_skills(df, pd.Timestamp("2020-06-15 23:00")).sum() == 0
         assert update_skills(df, pd.Timestamp("2020-06-16 01:00")).sum() == 0
 
     def test_the_shared_array_is_read_only(self):
