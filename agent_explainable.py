@@ -46,6 +46,74 @@ from ReplayBuffers import (
 # -----------------------------
 # Utility helpers
 # -----------------------------
+def _norm_layers(model: torch.nn.Module) -> Tuple[torch.nn.Module, ...]:
+    """The modules of `model` whose behaviour actually depends on train/eval.
+
+    Cached on the model, since the set never changes after construction.
+    """
+    cached = getattr(model, "_train_sensitive_modules", None)
+    if cached is None:
+        cached = tuple(
+            m for m in model.modules()
+            if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm, torch.nn.Dropout))
+        )
+        model._train_sensitive_modules = cached
+    return cached
+
+
+class inference_pass:
+    """Run a forward pass in eval mode, restoring training mode afterwards.
+
+    `model.eval()` / `model.train()` walk the whole module tree and assign
+    `self.training` on every submodule. Around a single-state forward that is
+    559k `train()` calls and 560k `__setattr__` per 3k interventions -- 6 s of a
+    60 s training run, 10%, to flip a flag that only batch-norm and dropout
+    read.
+
+    Only those modules are toggled here, and only the ones that were actually
+    training are restored, so a model deliberately left in eval stays there.
+    Pairs with `torch.inference_mode()` at the call sites, which is what
+    disables autograd; this class only handles the mode.
+    """
+
+    __slots__ = ("_was_training",)
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self._was_training = [m for m in _norm_layers(model) if m.training]
+
+    def __enter__(self) -> "inference_pass":
+        for m in self._was_training:
+            m.training = False
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for m in self._was_training:
+            m.training = True
+
+
+def _best_feasible_action(q: Tensor, potential_actions: Sequence[int]) -> int:
+    """`filter_q_values` without moving the whole Q vector off the device.
+
+    Ties matter: `max(..., key=...)` keeps the *first* action of
+    `potential_actions` among equals, and equal Q-values are common early in
+    training when the network is near-untrained. `torch.argmax` returns the
+    lowest *index*, which is a different action whenever `potential_actions` is
+    not sorted, so the winner is chosen by comparing values in the caller's
+    order rather than by argmax.
+    """
+    if len(potential_actions) == 1:
+        return int(potential_actions[0])
+    # Historical special-case kept for backward compatibility.
+    if list(potential_actions) == [79]:
+        return 79
+
+    idx = torch.as_tensor(potential_actions, dtype=torch.long, device=q.device)
+    values = q.flatten().index_select(0, idx)
+    # One transfer of len(potential_actions) floats, not the full action space.
+    best = max(range(len(potential_actions)), key=values.tolist().__getitem__)
+    return int(potential_actions[best])
+
+
 def _as_tensor(x: Union[np.ndarray, Tensor], device: torch.device) -> Tensor:
     """Convert numpy arrays to float32 tensors on the given device.
 
@@ -341,13 +409,13 @@ class DQNAgent:
             return action, skill_lvl, potential_actions
 
         state_t = _as_tensor(state, self.device)
-        self.qnetwork_local.eval()
-        with torch.inference_mode():
+        with torch.inference_mode(), inference_pass(self.qnetwork_local):
             q = self.qnetwork_local(state_t)
-        self.qnetwork_local.train()
 
-        q_values = q.detach().cpu().numpy().flatten().tolist()
-        action = filter_q_values(q_values, potential_actions)
+        # Only the feasible actions are ever read, so the argmax is taken on
+        # the device and one scalar comes back instead of the whole 80-value
+        # vector. `.cpu()` was 3.2 s of a 60 s run across 33k transfers.
+        action = _best_feasible_action(q, potential_actions)
         skill_lvl = potential_skills[potential_actions.index(action)]
         return action, skill_lvl, potential_actions
 
@@ -708,16 +776,20 @@ class FQFAgent:
 
         state_t = torch.from_numpy(state.flatten()).float().to(self.device)
 
-        self.qnetwork_local.eval()
-        with torch.inference_mode():
+        with torch.inference_mode(), inference_pass(self.qnetwork_local):
             embedding = self.qnetwork_local.forward(state_t)
             taus, taus_, _entropy = self.fpn(embedding)
             f_z = self.qnetwork_local.get_quantiles(state_t, taus_, embedding)
             q = ((taus[:, 1:].unsqueeze(-1) - taus[:, :-1].unsqueeze(-1)) * f_z).sum(1)
-        self.qnetwork_local.train()
 
-        q_list = q.detach().cpu().numpy().flatten().tolist()
-        action = filter_q_values(q_list, potential_actions)
+        # The full vector is only needed to fill `explain`; the choice itself
+        # reads the feasible actions alone, so the transfer is skipped when
+        # nothing will report it.
+        if explain is not None:
+            q_list = q.detach().cpu().numpy().flatten().tolist()
+            action = filter_q_values(q_list, potential_actions)
+        else:
+            action = _best_feasible_action(q, potential_actions)
         skill_lvl = potential_skills[potential_actions.index(action)]
 
         if explain is not None:
