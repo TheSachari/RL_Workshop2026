@@ -31,7 +31,7 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int, help="end after num_inter")
     parser.add_argument("--save_metrics_as", type=str, help="save dic_indic as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
-    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--constraint_factor_ff", type=float, default=1, help="available firefighters. An int is the historical global draw (3 keeps 33%%); a fraction like 0.8 keeps that share of EVERY station (stratified, continuous)")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
     # Mirrors the agent runner's flags, so a baseline log is comparable to an
     # agent log field for field. `--n_hours`/`--top_n` only matter when logging.

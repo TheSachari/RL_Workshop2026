@@ -73,7 +73,7 @@ if __name__ == "__main__":
     parser.add_argument("--reward_weights", type=str, help="JSON file with reward weights")
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
-    parser.add_argument("--constraint_factor_ff", type=int, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
+    parser.add_argument("--constraint_factor_ff", type=float, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
     parser.add_argument("--resume", action='store_true', help="Resume from the checkpoint written by --checkpoint_name")
     parser.add_argument("--checkpoint_name", type=str, default=None, help="Resumable checkpoint file (default: <model_name>.ckpt)")

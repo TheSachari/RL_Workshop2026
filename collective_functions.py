@@ -20,6 +20,7 @@ import pickle
 import random
 import re
 import weakref
+from collections import Counter, defaultdict
 from datetime import timedelta
 
 import numpy as np
@@ -373,6 +374,76 @@ def get_neighborhood_availability(pdd, station, num_d, dic_vehicles, planning, m
         info_avail = [0] * n_following * 2
     return info_avail
 
+def _station_of_each_ff(planning):
+    """Map every rostered firefighter to the station they are planned in most.
+
+    `df_skills` carries no station, so the only record of where someone serves
+    is `planning`. 88% appear in exactly one station and the median dominant
+    share is 100%, so "the station holding most of their slots" is a faithful
+    attachment rather than an arbitrary tie-break.
+
+    Returns
+    -------
+    dict[int, str]
+        matricule -> station. Firefighters absent from `planning` (1531 of 3343
+        in the shipped data) are simply missing from the mapping; callers must
+        decide what to do with them.
+    """
+    slots = defaultdict(Counter)
+    for station, months in planning.items():
+        for _, days in months.items():
+            for _, hours in days.items():
+                for _, entry in hours.items():
+                    for ff in entry.get("available", []):
+                        slots[ff][station] += 1
+    return {ff: c.most_common(1)[0][0] for ff, c in slots.items()}
+
+
+def constrain_ff(df_skills, ratio, planning, seed=DEFAULT_SEED):
+    """Keep `ratio` of the workforce, drawn evenly within each station.
+
+    The plain `df_skills.sample(len(df)//factor)` this replaces draws globally,
+    which spreads the cut unevenly across stations by luck alone: at factor 2
+    the per-station retention ranged from 34% to 100%, a 66-point spread on a
+    nominal 50%. That noise varies with the seed and lands hardest on the small
+    stations, so part of any measured effect was the draw rather than the
+    constraint. Sampling within each station instead holds every station at the
+    same fraction.
+
+    `ratio` is a float, so pressure is continuous: the integer factor only
+    offered 100% / 50% / 33%, and the jump from 1 to 2 multiplied `rupture_ff`
+    by 9.5 with nothing in between.
+
+    Firefighters absent from `planning` form their own stratum, sampled at the
+    same ratio, so the total kept still matches `ratio` overall.
+
+    Returns the kept rows, in the original table's order.
+    """
+    if not 0 < ratio <= 1:
+        raise ValueError(f"ff ratio must be in (0, 1], got {ratio}")
+    if ratio == 1:
+        return df_skills
+
+    station = _station_of_each_ff(planning)
+    # `.get` puts the never-rostered in one bucket of their own rather than
+    # dropping them: they are in df_skills and can still be picked up by the
+    # role scan, so exempting them would quietly soften the constraint.
+    groups = df_skills.groupby(df_skills.index.map(lambda ff: station.get(ff, "__unrostered__")))
+
+    kept = []
+    for i, (_, block) in enumerate(sorted(groups, key=lambda kv: str(kv[0]))):
+        n = int(round(len(block) * ratio))
+        # Never empty a station outright: a station with no crew answers
+        # nothing, which is a different scenario from a thinly-crewed one.
+        n = max(1, min(len(block), n))
+        # Vary the sub-seed per station so every station does not keep the same
+        # positional slice of its roster.
+        kept.append(block.sample(n, random_state=seed + i))
+
+    out = pd.concat(kept)
+    return out.reindex([i for i in df_skills.index if i in set(out.index)])
+
+
 def load_environment_variables(constraint_factor_veh, constraint_factor_ff, dataset, start, end,
                                seed=DEFAULT_SEED):
 
@@ -442,22 +513,32 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
 
     df_skills = pd.read_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
 
-    # random_state is required: DataFrame.sample draws from numpy's global RNG,
-    # which random.seed() does not control. Without it the workforce was redrawn
-    # on every run and the same command produced different metrics. Note this
-    # also matters at factor 1, where the set is unchanged but the *order* is
-    # not, and roles are assigned by scanning firefighters in order.
-    df_skills = df_skills.sample(len(df_skills)//constraint_factor_ff, random_state=seed)
-    print("constraint factor ff is ", constraint_factor_ff)
+    # Loaded before the workforce is cut: stratified sampling needs to know
+    # which station each firefighter serves, and only `planning` records that.
+    with open(DATA_ENVIRONMENT / "planning.pkl", "rb") as file:
+        planning = pickle.load(file)
+
+    # An int keeps the historical global draw, so every run made before the
+    # stratified path stays reproducible; a float routes to `constrain_ff`,
+    # which holds each station at the same fraction. `1` and `1.0` agree.
+    if isinstance(constraint_factor_ff, float) and constraint_factor_ff != int(constraint_factor_ff):
+        df_skills = constrain_ff(df_skills, constraint_factor_ff, planning, seed)
+        print("constraint ratio ff is ", constraint_factor_ff, "(stratified by station)")
+    else:
+        # random_state is required: DataFrame.sample draws from numpy's global RNG,
+        # which random.seed() does not control. Without it the workforce was redrawn
+        # on every run and the same command produced different metrics. Note this
+        # also matters at factor 1, where the set is unchanged but the *order* is
+        # not, and roles are assigned by scanning firefighters in order.
+        constraint_factor_ff = int(constraint_factor_ff)
+        df_skills = df_skills.sample(len(df_skills)//constraint_factor_ff, random_state=seed)
+        print("constraint factor ff is ", constraint_factor_ff)
 
     df_roles = pd.read_pickle(DATA_ENVIRONMENT / "df_roles.pkl")
     dic_roles_skills = generate_dic_roles_skills(df_roles, df_skills)
 
     df_vehicles_history = pd.read_pickle(DATA_ENVIRONMENT / "df_vehicles_history.pkl")
     dic_roles = create_dic_roles(df_vehicles_history)
-
-    with open(DATA_ENVIRONMENT / "planning.pkl", "rb") as file:
-        planning = pickle.load(file)
 
     df_pc = pd.read_pickle(resolve(dataset, DATA_ENVIRONMENT))
 
