@@ -8,8 +8,11 @@ import gc
 
 import numpy as np
 import pandas as pd
+import pytest
 
+import collective_functions
 from collective_functions import (
+    _SKILL_VALID_CACHE,
     _SKILL_WINDOW_CACHE,
     extract_skills,
     get_role_from_skills,
@@ -218,3 +221,72 @@ class TestSkillWindowCache:
 
         assert update_skills(valid, date).sum() == 8      # all valid
         assert update_skills(expired, date).sum() == 0    # none valid
+
+
+class TestValidityCache:
+    """`update_skills` memoises per calendar day.
+
+    The loop recomputes whenever the stream's date advances -- 8018 times per
+    4000 interventions -- while validity windows only turn over at midnight, so
+    all but one call per day recompute the same matrix. Caching them cut a
+    4000-intervention baseline from 27.9 s to 15.9 s with identical metrics.
+
+    Two things have to hold for that to be safe: a day boundary must still be
+    seen, and the shared array must not be writable, since callers would
+    otherwise corrupt every later reader of the same day.
+    """
+
+    @staticmethod
+    def table(open_from, open_until, n_ff=4, n_skills=3):
+        columns = pd.MultiIndex.from_product(
+            [[f"skill{i}" for i in range(n_skills)], ["Début", "Fin"]]
+        )
+        row = [pd.Timestamp(open_from), pd.Timestamp(open_until)] * n_skills
+        return pd.DataFrame([row] * n_ff, index=range(n_ff), columns=columns)
+
+    def test_the_same_day_is_served_from_the_cache(self):
+        df = self.table("2018-01-01", "2030-01-01")
+        _SKILL_VALID_CACHE.clear()
+        morning = update_skills(df, pd.Timestamp("2020-06-15 03:00"))
+        evening = update_skills(df, pd.Timestamp("2020-06-15 23:59"))
+        assert morning is evening
+
+    def test_a_window_closing_overnight_is_still_seen(self):
+        """The bug a coarser cache would cause: the day boundary must matter."""
+        df = self.table("2018-01-01", "2020-06-15")
+        _SKILL_VALID_CACHE.clear()
+        assert update_skills(df, pd.Timestamp("2020-06-15 23:00")).sum() == 12
+        assert update_skills(df, pd.Timestamp("2020-06-16 01:00")).sum() == 0
+
+    def test_the_shared_array_is_read_only(self):
+        df = self.table("2018-01-01", "2030-01-01")
+        _SKILL_VALID_CACHE.clear()
+        valid = update_skills(df, pd.Timestamp("2020-06-15"))
+        with pytest.raises(ValueError):
+            valid[0, 0] = 0
+
+    def test_the_cache_is_bounded(self):
+        """A ten-year run touches 3652 days; keeping them all cost 13 GB."""
+        df = self.table("2018-01-01", "2030-01-01")
+        _SKILL_VALID_CACHE.clear()
+        start = pd.Timestamp("2020-01-01")
+        for offset in range(collective_functions._SKILL_VALID_MAX_DAYS + 6):
+            update_skills(df, start + pd.Timedelta(days=offset))
+        held = _SKILL_VALID_CACHE[id(df)][1]
+        assert len(held) <= collective_functions._SKILL_VALID_MAX_DAYS
+
+    def test_two_tables_do_not_share_a_day(self):
+        _SKILL_VALID_CACHE.clear()
+        date = pd.Timestamp("2020-06-15")
+        live = self.table("2018-01-01", "2030-01-01")
+        expired = self.table("2000-01-01", "2001-01-01")
+        assert update_skills(live, date).sum() == 12
+        assert update_skills(expired, date).sum() == 0
+
+    def test_entries_die_with_their_table(self):
+        _SKILL_VALID_CACHE.clear()
+        for _ in range(30):
+            update_skills(self.table("2018-01-01", "2030-01-01"),
+                          pd.Timestamp("2020-06-15"))
+        gc.collect()
+        assert len(_SKILL_VALID_CACHE) <= 1

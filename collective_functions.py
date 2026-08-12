@@ -38,6 +38,17 @@ DEFAULT_SEED = 42
 # -- see `_skill_windows`.
 _SKILL_WINDOW_CACHE = {}
 
+# Validity matrices from `update_skills`, keyed the same way but holding a few
+# calendar days each: the windows turn over at midnight, so one matrix serves
+# every event of its day.
+#
+# Bounded, because the stream walks forward: a ten-year run touches 3652 days,
+# and keeping them all would cost 13 GB at int64 or 1.6 GB at int8. Days are
+# never revisited once passed, so a handful of recent ones captures every hit
+# while the rest would only be dead weight.
+_SKILL_VALID_CACHE = {}
+_SKILL_VALID_MAX_DAYS = 4
+
 def get_skills_from_role(df_roles, role):
     """
     Return the skill requirement expression for a given role.
@@ -1824,10 +1835,51 @@ def update_skills(df_skills, date_reference):
     `pd.concat` the lot, on every event whose date advanced the reference --
     77% of a training run's wall time, dwarfing the network's own forward and
     backward passes. The comparison is the same one, done once over two arrays.
+
+    Memoised per calendar day, which is exact rather than an approximation:
+    validity windows start and end at midnight, so every reference within the
+    same day yields the same matrix. The simulation loop recomputes this
+    whenever the event stream's date advances -- 8018 times per 4000
+    interventions, a third of the loop's time -- against one distinct value per
+    day.
+
+    The returned array is shared and marked read-only, so a caller that needs
+    to write must copy first. Every caller today either fancy-indexes it (which
+    copies) or reduces it.
     """
     starts, ends = _skill_windows(df_skills)
-    reference = np.datetime64(pd.Timestamp(date_reference), "ns").astype("float64")
-    return np.where((starts <= reference) & (ends >= reference), 1, 0)
+    day = pd.Timestamp(date_reference).normalize()
+
+    key = id(df_skills)
+    cached = _SKILL_VALID_CACHE.get(key)
+    if cached is not None and cached[0]() is df_skills:
+        hit = cached[1].get(day)
+        if hit is not None:
+            return hit
+    else:
+        cached = None
+
+    reference = np.datetime64(day, "ns").astype("float64")
+    # int8: the result is 0/1, and at 3343x134 the dtype is the difference
+    # between 3.6 MB and 0.45 MB per cached day.
+    valid = ((starts <= reference) & (ends >= reference)).astype(np.int8)
+    valid.flags.writeable = False
+
+    if cached is None:
+        try:
+            table_ref = weakref.ref(
+                df_skills, lambda _, k=key: _SKILL_VALID_CACHE.pop(k, None)
+            )
+        except TypeError:
+            return valid          # un-weakref-able view: correct, just uncached
+        cached = (table_ref, {})
+        _SKILL_VALID_CACHE[key] = cached
+
+    days = cached[1]
+    days[day] = valid
+    while len(days) > _SKILL_VALID_MAX_DAYS:
+        days.pop(next(iter(days)))    # dicts keep insertion order: drop oldest
+    return valid
 
 def update_dep(required_departure):
     """
