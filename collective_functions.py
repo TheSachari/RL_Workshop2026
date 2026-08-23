@@ -239,24 +239,29 @@ def get_potential_actions(state, all_ff_waiting):
     # 2nd row: idx role
 
     potential_actions = [79]
-    skill_lvl = 0
     potential_skills = [0]
     cond_met = np.array([])
     # state = state.cpu().numpy()
     col_index = np.argmax(state[1, :] == 1) # current role
-    column_values = state[2:, col_index] # ff available for a given role
+    body = state[N_HEADER_ROWS:]
+    column_values = body[:, col_index] # ff available for a given role
 
     if not all_ff_waiting: # standard case
-        selection = column_values[column_values > 0] # ff having the skill
-        if selection.size > 0: # any ff ?        
-            cond_met = np.where( (column_values > 0) & (np.all(state[2:, -3:] == 0, axis=1)) )[0] # ff having any skill lvl > 0
-            potential_skills = column_values[(column_values > 0) & (np.all(state[2:, -3:] == 0, axis=1))].tolist()
+        # One mask, used for both the indices and the levels. The two lines
+        # this replaces built `(column_values > 0) & np.all(...)` twice --
+        # `np.where(...)` for the indices and the same expression again to
+        # index `column_values` -- so the availability scan over the whole
+        # padded body ran twice per decision.
+        free = ~body[:, -N_AVAILABILITY_COLS:].any(axis=1)
+        feasible = (column_values > 0) & free
+        if feasible.any():
+            cond_met = np.flatnonzero(feasible)
+            potential_skills = column_values[feasible].tolist()
     else: # all ff waiting
-        selection = column_values # all ff to avoid the case of a ff losing his skills
-        if selection.size > 0: # any ff ?
-            cond_met = np.where( (state[2:, -2] == 1) )[0]                                               
-            cond_met = np.array([cond_met[0]]) # first ff because all ff waiting follows an order
-            
+        if column_values.size > 0: # any ff ?
+            # all ff to avoid the case of a ff losing his skills
+            cond_met = np.flatnonzero(body[:, -2] == 1)[:1]  # first ff: order matters
+
     if cond_met.size > 0:
         potential_actions = cond_met.tolist()
     else:
@@ -268,7 +273,7 @@ def get_potential_actions(state, all_ff_waiting):
     if all_ff_waiting:
         assert potential_actions == [0], "not action 0 and all_ff_waiting"
 
-        
+
     return potential_actions, potential_skills
 
 def get_v_availability(dic_vehicles, station):
