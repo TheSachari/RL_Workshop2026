@@ -21,7 +21,7 @@ own `num_d` sentinel, and some branches carry extra guards. So this groups the
 state without merging the code paths.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List
 
 # Departure sentinel identifying a reinforcement request per vehicle type.
@@ -98,6 +98,35 @@ class Environment:
     old_date: object
     date_reference: object
     skills_updated: object
+
+    def fork(self) -> "Environment":
+        """An independent environment sharing this one's read-only tables.
+
+        Copies exactly the seven containers the simulation mutates -- the same
+        set `checkpoint.ENV_FIELDS` saves, for the same reason. Everything else
+        (the skills frame, the role and distance tables, the event stream) is
+        read throughout a run and is shared rather than duplicated.
+
+        `planning` goes through `PlanningView.copy`, which shares slots until
+        one side writes; the other six are small enough that a `deepcopy` costs
+        about a millisecond between them.
+
+        This is what the planning rewrite was for: forking used to mean copying
+        334,056 slot dicts at 2.7 s, so several environments could not be
+        stepped in parallel. It is now fast enough to be worth doing per actor.
+        """
+        import copy as _copy
+
+        return replace(
+            self,
+            planning=self.planning.copy(),
+            dic_vehicles=_copy.deepcopy(self.dic_vehicles),
+            dic_inter=_copy.deepcopy(self.dic_inter),
+            dic_ff=dict(self.dic_ff),
+            dic_indic=dict(self.dic_indic),
+            dic_indic_old=dict(self.dic_indic_old),
+            dic_lent=_copy.deepcopy(self.dic_lent),
+        )
 
     def as_tuple(self):
         """The original 18-tuple, for callers not yet migrated."""
