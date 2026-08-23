@@ -359,21 +359,29 @@ class DQNAgent:
             self.icm = ICM(inverse_m, forward_m).to(device)
             print(inverse_m, forward_m)
 
-    def step(
+    def observe(
         self,
         state: np.ndarray,
         action: int,
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> Optional[float]:
-        """Store transition and trigger a learning step periodically."""
+    ) -> None:
+        """Store one transition. No gradient work happens here."""
         state_t = torch.from_numpy(state).float()
         next_state_t = torch.from_numpy(next_state).float()
 
         self.memory.add(state_t, action, reward, next_state_t, done)
         self.t_step += 1
 
+    def train_step(self) -> Optional[float]:
+        """Learn from a batch if one is due, else None.
+
+        Split from `observe` so the two can run at different rates or in
+        different threads: an actor stepping the environment only needs to
+        store, and whoever owns the network decides when to consume the
+        buffer. `step` keeps the combined behaviour for the single-actor path.
+        """
         if self.t_step % self.update_every != 0:
             return None
 
@@ -389,6 +397,18 @@ class DQNAgent:
 
         self.q_updates += 1
         return loss_value
+
+    def step(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> Optional[float]:
+        """Store transition and trigger a learning step periodically."""
+        self.observe(state, action, reward, next_state, done)
+        return self.train_step()
 
     def act(
         self,
@@ -594,6 +614,7 @@ class FQFAgent:
         decay_update: int,
         device: torch.device,
         seed: int,
+        pointer: bool = False,
     ) -> None:
         self.state_size = state_size
         self.action_size = action_size
@@ -649,32 +670,13 @@ class FQFAgent:
         )
 
         # Networks
-        self.qnetwork_local = QVN(
-            state_size,
-            action_size,
-            layer_size,
-            am,
-            n_steps,
-            device,
-            seed,
-            n_quantiles,
-            num_layers,
-            layer_type,
-            use_batchnorm,
-        ).to(device)
-        self.qnetwork_target = QVN(
-            state_size,
-            action_size,
-            layer_size,
-            am,
-            n_steps,
-            device,
-            seed,
-            n_quantiles,
-            num_layers,
-            layer_type,
-            use_batchnorm,
-        ).to(device)
+        self.pointer = pointer
+        qvn_args = (
+            state_size, action_size, layer_size, am, n_steps, device, seed,
+            n_quantiles, num_layers, layer_type, use_batchnorm,
+        )
+        self.qnetwork_local = QVN(*qvn_args, pointer=pointer).to(device)
+        self.qnetwork_target = QVN(*qvn_args, pointer=pointer).to(device)
         self.optimizer = optim.AdamW(self.qnetwork_local.parameters(), lr=lr)
         print(self.qnetwork_local)
 
@@ -709,15 +711,15 @@ class FQFAgent:
             self.icm = ICM(inverse_m, forward_m).to(device)
             print(inverse_m, forward_m)
 
-    def step(
+    def observe(
         self,
         state: np.ndarray,
         action: int,
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> Optional[float]:
-        """Store transition and trigger a learning step periodically."""
+    ) -> None:
+        """Store one transition. No gradient work happens here."""
         self.memory.add(
             torch.from_numpy(state).float(),
             action,
@@ -727,6 +729,14 @@ class FQFAgent:
         )
         self.t_step += 1
 
+    def train_step(self) -> Optional[float]:
+        """Learn from a batch if one is due, else None.
+
+        Split from `observe` so the two can run at different rates or in
+        different threads: an actor stepping the environment only needs to
+        store, and whoever owns the network decides when to consume the
+        buffer. `step` keeps the combined behaviour for the single-actor path.
+        """
         if self.t_step % self.update_every != 0:
             return None
 
@@ -742,6 +752,18 @@ class FQFAgent:
 
         self.q_updates += 1
         return loss_value
+
+    def step(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> Optional[float]:
+        """Store transition and trigger a learning step periodically."""
+        self.observe(state, action, reward, next_state, done)
+        return self.train_step()
 
     def act(
         self,
@@ -778,8 +800,15 @@ class FQFAgent:
 
         with torch.inference_mode(), inference_pass(self.qnetwork_local):
             embedding = self.qnetwork_local.forward(state_t)
+            entities = None
+            if self.pointer:
+                # The pointer path returns the candidate embeddings alongside
+                # the context; only the context feeds the fraction network.
+                embedding, entities = embedding
             taus, taus_, _entropy = self.fpn(embedding)
-            f_z = self.qnetwork_local.get_quantiles(state_t, taus_, embedding)
+            f_z = self.qnetwork_local.get_quantiles(
+                state_t, taus_, embedding, entities=entities
+            )
             q = ((taus[:, 1:].unsqueeze(-1) - taus[:, :-1].unsqueeze(-1)) * f_z).sum(1)
 
         # The full vector is only needed to fill `explain`; the choice itself
@@ -808,6 +837,19 @@ class FQFAgent:
 
         return action, skill_lvl, potential_actions
 
+    def _encode(self, network, states):
+        """`(context, entities)` from a forward, whichever head is in use.
+
+        The pointer path returns both; the flatten path returns the context
+        alone and scores from slot position, so its entities are None. Every
+        `get_quantiles` call in `learn`/`learn_per` goes through this, so the
+        two paths differ in one place rather than at ten call sites.
+        """
+        out = network.forward(states)
+        if self.pointer:
+            return out
+        return out, None
+
     def soft_update(self, local_model: torch.nn.Module, target_model: torch.nn.Module) -> None:
         for target_param, local_param in zip(
             target_model.parameters(), local_model.parameters()
@@ -829,11 +871,13 @@ class FQFAgent:
         dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
 
         # Fraction proposal network produces taus and their midpoints taus_
-        embedding = self.qnetwork_local.forward(states_t)
+        embedding, entities = self._encode(self.qnetwork_local, states_t)
         taus, taus_, entropy = self.fpn(embedding.detach())
 
         # Quantiles for current state-action
-        f_z_expected = self.qnetwork_local.get_quantiles(states_t, taus_, embedding)
+        f_z_expected = self.qnetwork_local.get_quantiles(
+            states_t, taus_, embedding, entities=entities
+        )
         q_expected = f_z_expected.gather(
             2, actions_t.unsqueeze(-1).expand(self.batch_size, self.n_quantiles, 1)
         )
@@ -842,7 +886,7 @@ class FQFAgent:
         # Fraction loss
         with torch.inference_mode():
             f_z_tau = self.qnetwork_local.get_quantiles(
-                states_t, taus[:, 1:-1], embedding.detach()
+                states_t, taus[:, 1:-1], embedding.detach(), entities=entities
             )
             fz_tau = f_z_tau.gather(
                 2, actions_t.unsqueeze(-1).expand(self.batch_size, self.n_quantiles - 1, 1)
@@ -867,10 +911,13 @@ class FQFAgent:
         # Targets
         if not self.munchausen:
             with torch.inference_mode():
-                next_embedding_loc = self.qnetwork_local.forward(next_states_t)
+                next_embedding_loc, next_entities_loc = self._encode(
+                    self.qnetwork_local, next_states_t
+                )
                 n_taus, n_taus_, _ = self.fpn(next_embedding_loc)
                 f_z_next_loc = self.qnetwork_local.get_quantiles(
-                    next_states_t, n_taus_, next_embedding_loc
+                    next_states_t, n_taus_, next_embedding_loc,
+                    entities=next_entities_loc,
                 )
                 q_targets_next_loc = (
                     (n_taus[:, 1:].unsqueeze(-1) - n_taus[:, :-1].unsqueeze(-1))
@@ -878,9 +925,11 @@ class FQFAgent:
                 ).sum(1)
                 action_idx = torch.argmax(q_targets_next_loc, dim=1, keepdim=True)
 
-                next_embedding = self.qnetwork_target.forward(next_states_t)
+                next_embedding, next_entities = self._encode(
+                    self.qnetwork_target, next_states_t
+                )
                 f_z_next = self.qnetwork_target.get_quantiles(
-                    next_states_t, taus_, next_embedding
+                    next_states_t, taus_, next_embedding, entities=next_entities
                 )
                 q_targets_next = (
                     f_z_next.gather(
@@ -894,13 +943,16 @@ class FQFAgent:
                 )
         else:
             # Munchausen target (kept close to your original implementation)
-            ns_embedding = self.qnetwork_target.forward(next_states_t).detach()
+            ns_embedding, ns_entities = self._encode(
+                self.qnetwork_target, next_states_t
+            )
+            ns_embedding = ns_embedding.detach()
             ns_taus, ns_taus_, ns_entropy = self.fpn(ns_embedding.detach())
             ns_taus = ns_taus.detach()
             ns_entropy = ns_entropy.detach()
 
             m_quantiles = self.qnetwork_target.get_quantiles(
-                next_states_t, ns_taus_, ns_embedding
+                next_states_t, ns_taus_, ns_embedding, entities=ns_entities
             ).detach()
             m_q = ((ns_taus[:, 1:].unsqueeze(-1) - ns_taus[:, :-1].unsqueeze(-1)) * m_quantiles).sum(
                 1
@@ -926,7 +978,7 @@ class FQFAgent:
             ).unsqueeze(1)
 
             m_quantiles_targets = self.qnetwork_local.get_quantiles(
-                states_t, taus_, embedding
+                states_t, taus_, embedding, entities=entities
             ).detach()
             m_q_targets = (
                 (taus[:, 1:].unsqueeze(-1).detach() - taus[:, :-1].unsqueeze(-1).detach())
@@ -990,17 +1042,19 @@ class FQFAgent:
         dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
         weights_t = torch.as_tensor(weights, dtype=torch.float32, device=self.device).view(-1, 1)
 
-        embedding = self.qnetwork_local.forward(states_t)
+        embedding, entities = self._encode(self.qnetwork_local, states_t)
         taus, taus_, entropy = self.fpn(embedding.detach())
 
-        f_z_expected = self.qnetwork_local.get_quantiles(states_t, taus_, embedding)
+        f_z_expected = self.qnetwork_local.get_quantiles(
+            states_t, taus_, embedding, entities=entities
+        )
         q_expected = f_z_expected.gather(
             2, actions_t.unsqueeze(-1).expand(self.batch_size, self.n_quantiles, 1)
         )
 
         with torch.inference_mode():
             f_z_tau = self.qnetwork_local.get_quantiles(
-                states_t, taus[:, 1:-1], embedding.detach()
+                states_t, taus[:, 1:-1], embedding.detach(), entities=entities
             )
             fz_tau = f_z_tau.gather(
                 2, actions_t.unsqueeze(-1).expand(self.batch_size, self.n_quantiles - 1, 1)
@@ -1012,10 +1066,13 @@ class FQFAgent:
         # Targets (munchausen or not) - keep original logic
         if not self.munchausen:
             with torch.inference_mode():
-                next_embedding_loc = self.qnetwork_local.forward(next_states_t)
+                next_embedding_loc, next_entities_loc = self._encode(
+                    self.qnetwork_local, next_states_t
+                )
                 n_taus, n_taus_, _ = self.fpn(next_embedding_loc)
                 f_z_next_loc = self.qnetwork_local.get_quantiles(
-                    next_states_t, n_taus_, next_embedding_loc
+                    next_states_t, n_taus_, next_embedding_loc,
+                    entities=next_entities_loc,
                 )
                 q_targets_next_loc = (
                     (n_taus[:, 1:].unsqueeze(-1) - n_taus[:, :-1].unsqueeze(-1))
@@ -1023,9 +1080,11 @@ class FQFAgent:
                 ).sum(1)
                 action_idx = torch.argmax(q_targets_next_loc, dim=1, keepdim=True)
 
-                next_embedding = self.qnetwork_target.forward(next_states_t)
+                next_embedding, next_entities = self._encode(
+                    self.qnetwork_target, next_states_t
+                )
                 f_z_next = self.qnetwork_target.get_quantiles(
-                    next_states_t, taus_, next_embedding
+                    next_states_t, taus_, next_embedding, entities=next_entities
                 )
                 q_targets_next = (
                     f_z_next.gather(
@@ -1038,13 +1097,16 @@ class FQFAgent:
                     1.0 - dones_t.unsqueeze(-1)
                 )
         else:
-            ns_embedding = self.qnetwork_target.forward(next_states_t).detach()
+            ns_embedding, ns_entities = self._encode(
+                self.qnetwork_target, next_states_t
+            )
+            ns_embedding = ns_embedding.detach()
             ns_taus, ns_taus_, ns_entropy = self.fpn(ns_embedding.detach())
             ns_taus = ns_taus.detach()
             ns_entropy = ns_entropy.detach()
 
             m_quantiles = self.qnetwork_target.get_quantiles(
-                next_states_t, ns_taus_, ns_embedding
+                next_states_t, ns_taus_, ns_embedding, entities=ns_entities
             ).detach()
             m_q = ((ns_taus[:, 1:].unsqueeze(-1) - ns_taus[:, :-1].unsqueeze(-1)) * m_quantiles).sum(
                 1
@@ -1070,7 +1132,7 @@ class FQFAgent:
             ).unsqueeze(1)
 
             m_quantiles_targets = self.qnetwork_local.get_quantiles(
-                states_t, taus_, embedding
+                states_t, taus_, embedding, entities=entities
             ).detach()
             m_q_targets = (
                 (taus[:, 1:].unsqueeze(-1).detach() - taus[:, :-1].unsqueeze(-1).detach())

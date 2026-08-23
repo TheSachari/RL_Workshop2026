@@ -43,19 +43,28 @@ import torch
 
 import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
-from collective_functions import DEFAULT_SEED, compute_reward, load_environment
+from collective_functions import (
+    DEFAULT_SEED,
+    N_HEADER_ROWS,
+    check_reward_weights,
+    compute_reward,
+    load_environment,
+    state_size_for,
+    state_width,
+)
 from decision_log import DecisionLog, rarest_skills
 from explainability import (
     get_dic_rare_skills,
     get_related_rows_in_time,
-    rare_skills_for_step,
     irreversible_spent_by,
+    rare_skills_for_step,
     rare_skills_still_covered,
     rarity_features,
 )
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
 from simulator import run_simulation
+from transition import PendingTransition
 
 # Shared empty result, for decisions where scoped rarity is not computed.
 _EMPTY = np.array([], dtype=int)
@@ -77,6 +86,7 @@ if __name__ == "__main__":
     # decision log; these expose it to the policy and to the reward.
     parser.add_argument("--rarity_features", action="store_true", help="feed per-candidate scarcity (locally rare / irreversible / upcoming) to the network")
     parser.add_argument("--shaping_coeff", type=float, default=0.0, help="weight of potential-based shaping on rare skills still covered (0 disables)")
+    parser.add_argument("--pointer", action="store_true", help="score candidates from their own embeddings instead of a slot-indexed head (permutation-invariant, roster-size independent; not weight-compatible with the default head)")
     parser.add_argument("--reward_weights", type=str, help="JSON file with reward weights")
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
@@ -104,6 +114,20 @@ if __name__ == "__main__":
     with open(resolve(args.hyper_params, DATA), "r") as f:
         hyper_params = json.load(f)
 
+    # A `state_size` that disagrees with what `gen_state` builds does not fail
+    # here -- it fails several minutes in, at the first forward pass, as a
+    # reshape error quoting two lengths and naming neither the config nor the
+    # block that moved. Checked up front instead, against the one derivation.
+    expected_state_size = state_size_for(hyper_params["action_size"])
+    if hyper_params["state_size"] != expected_state_size:
+        raise SystemExit(
+            f"{args.hyper_params}: state_size is {hyper_params['state_size']}, "
+            f"but action_size {hyper_params['action_size']} with the current "
+            f"state layout gives {expected_state_size} "
+            f"({hyper_params['action_size']} + {N_HEADER_ROWS} rows x "
+            f"{state_width()} features). Update the config."
+        )
+
     device = torch.device(hyper_params["device"])
     # Off by default: anomaly mode records a stack trace for every autograd op
     # to attribute a future NaN, which costs real time on a run measured in
@@ -114,7 +138,7 @@ if __name__ == "__main__":
     if args.agent_model == "dqn":
         agent = DQNAgent(**hyper_params)
     elif args.agent_model == "fqf":
-        agent = FQFAgent(**hyper_params)
+        agent = FQFAgent(**hyper_params, pointer=args.pointer)
     elif args.agent_model == "ppo":
         agent = PPOAgent(**hyper_params)
     else:
@@ -157,6 +181,11 @@ if __name__ == "__main__":
     env = load_environment(args.constraint_factor_veh, args.constraint_factor_ff,
                            args.dataset, args.start, args.end, args.seed)
 
+    # Up front, not on the decision that first moves an unweighted counter:
+    # skipping zero deltas is what keeps the breakdown cheap, but it also means
+    # a weight file missing a rare counter would otherwise run for hours first.
+    check_reward_weights(env.dic_indic, dic_tarif)
+
     # Reinforcement bookkeeping for VSAV/FPT/EPA. Field defaults match the
     # flat initialisation this replaces ("" / False / 0).
     fleet = Fleet()
@@ -169,10 +198,16 @@ if __name__ == "__main__":
     # Eval starts at 0 and must stay there: see `on_return`, where the decay is
     # gated on training so its 0.05 floor cannot lift it back off zero.
     rl = {"eps": args.eps_start if args.train else 0.0, "d": 1,
-          "compute": False, "old_state": None, "reward": 0.0, "loss": 0,
-          "score": 0.0, "action_num": 0,
-          "potential": 0.0, "potential_old": None}
+          "loss": 0, "score": 0.0, "action_num": 0, "potential": None}
+
+    # The one-step lag between choosing an action and being able to learn from
+    # it, owned by one object instead of five keys in `rl`. See transition.py.
+    pending = PendingTransition(gamma=agent.gamma,
+                                shaping_coeff=args.shaping_coeff)
     reward_evo = []
+    # Cumulative contribution of each reward term, saved alongside the curve so
+    # a run's reward can be attributed rather than just plotted.
+    reward_parts = {}
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
     # Scoped rarity is constant within an hour for a given (station,
@@ -272,23 +307,18 @@ if __name__ == "__main__":
                 live["st"], n_following=args.top_n, cache=scoped_cache
             )
 
-        # `compute` guards the first action, where there is no old_state yet.
-        if rl["compute"] and args.train:
-            # Shaping is applied here, not in `on_action`: the term needs the
-            # potential of the *next* state, and this is the first point where
-            # both are known -- `agent.step` already consumes the previous
-            # transition's reward, so the two line up naturally.
-            reward = rl["reward"]
-            if args.shaping_coeff and rl["potential_old"] is not None:
-                reward += args.shaping_coeff * (
-                    agent.gamma * rl["potential"] - rl["potential_old"]
-                )
-            l0 = agent.step(rl["old_state"], rl["action"], reward, state, inter_done)
+        # Complete the previous decision's transition against this state, which
+        # is its `next_state`. Returns None on the first decision of a run --
+        # what the old `compute` flag guarded -- and the shaping term is applied
+        # inside, where both potentials are in scope.
+        transition = pending.close(state, inter_done, potential=rl["potential"])
+        rl["loss"] = 0
+        if transition is not None and args.train:
+            l0 = agent.step(transition.state, transition.action,
+                            transition.reward, transition.next_state,
+                            transition.done)
             if l0 is not None:
                 rl["loss"] = l0
-        else:
-            rl["loss"] = 0
-        rl["potential_old"] = rl["potential"]
 
         # Only ask for the Q-values when something will read them: filling the
         # dict copies a value per feasible action on every decision.
@@ -320,17 +350,27 @@ if __name__ == "__main__":
                 irreversible_rare_skills=scoped["irreversible"],
             )
 
-        rl["action"] = action
-        rl["old_state"] = state
+        # Opened with the potential of the state just acted on, so `close` can
+        # difference it against the next one.
+        pending.open(state, action, potential=rl["potential"])
         return action, skill_lvl, potential_actions
 
     def on_action(ctx):
         """Reward is the indicator delta, read before dic_indic_old is refreshed."""
-        rl["reward"] = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d, dic_tarif)
-        rl["score"] += rl["reward"]
+        # Accumulated per term as well as summed: a moving reward curve
+        # otherwise gives no way to tell which of the ~21 counters moved it.
+        # `parts` holds only the non-zero terms, which on most decisions is
+        # none, so this costs a dict update rather than a full pass.
+        parts = {}
+        reward = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d,
+                                dic_tarif, components=parts)
+        for name, value in parts.items():
+            reward_parts[name] = reward_parts.get(name, 0.0) + value
+
+        pending.add_reward(reward)
+        rl["score"] += reward
         rl["action_num"] += 1
-        reward_evo.append([rl["action_num"], rl["reward"]])
-        rl["compute"] = True
+        reward_evo.append([rl["action_num"], reward])
 
     def log_interval(num_inter, vehicle_out, fleet):
         rwd_mean = np.mean([r[1] for r in reward_evo[-100:]]) if reward_evo else float("nan")
@@ -366,6 +406,7 @@ if __name__ == "__main__":
             (metrics_path, env.dic_indic),
             (curves_path, {"num_inter": num_inter,
                            "reward_evo": reward_evo,
+                           "reward_parts": reward_parts,
                            "dic_saved_skills": dic_saved_skills}),
         ):
             tmp = path.with_suffix(path.suffix + ".tmp")

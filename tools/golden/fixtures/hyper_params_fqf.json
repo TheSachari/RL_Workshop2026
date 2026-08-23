@@ -1,5 +1,5 @@
 {
-  "state_size": 3280,
+  "state_size": 3526,
   "action_size": 80,
   "layer_type": "ff",
   "layer_size": 1024,

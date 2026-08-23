@@ -27,11 +27,47 @@ import numpy as np
 import pandas as pd
 
 from paths import DATA_ENVIRONMENT, resolve
+from planning_state import PlanningView, SlotStore
 from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F401
 
 # Seed for the environment's downsampling draws. Exposed so callers can vary it
 # across replicates; the default keeps a plain run reproducible.
 DEFAULT_SEED = 42
+
+# --- state geometry -------------------------------------------------------
+#
+# `gen_state` lays each candidate out as one row of three concatenated blocks,
+# and the network's attention module reads the state back as
+# (action_size + 2) rows of `state_width()`. The two have to agree, but the
+# width lived as a literal 37 inside `gen_state` and a literal 3280 in every
+# hyper-parameter file, so adding the rarity block silently desynchronised
+# them: the network kept deriving d_input = 3280 // 82 = 40 while the state
+# arrived 43 wide, and the mismatch only surfaced as a reshape error at the
+# first forward pass -- one that reports lengths, not which block moved.
+#
+# They are named here so a block can only be resized in one place, and
+# `state_size_for` gives callers the number to check a config against.
+N_ROLE_COLS = 37       # role-compatibility columns, one per role
+N_RARITY_COLS = 3      # locally rare / irreversible / upcoming, per candidate
+N_AVAILABILITY_COLS = 3  # normalised response time + the two sentinel masks
+
+# Rows the state carries above the per-candidate block: the rl_infos line and
+# the current-role one-hot.
+N_HEADER_ROWS = 2
+
+
+def state_width():
+    """Feature width of one state row — what the network calls `d_input`."""
+    return N_ROLE_COLS + N_RARITY_COLS + N_AVAILABILITY_COLS
+
+
+def state_size_for(action_size):
+    """Flattened state length for a given action size.
+
+    This is the `state_size` a hyper-parameter file has to declare. Deriving it
+    is what keeps a config from disagreeing with `gen_state`.
+    """
+    return (action_size + N_HEADER_ROWS) * state_width()
 
 # Skill validity windows, split out of the skills table once per table. Keyed by
 # `id(df_skills)` and holding a *weak* reference to it, so a recycled id cannot
@@ -204,24 +240,29 @@ def get_potential_actions(state, all_ff_waiting):
     # 2nd row: idx role
 
     potential_actions = [79]
-    skill_lvl = 0
     potential_skills = [0]
     cond_met = np.array([])
     # state = state.cpu().numpy()
     col_index = np.argmax(state[1, :] == 1) # current role
-    column_values = state[2:, col_index] # ff available for a given role
+    body = state[N_HEADER_ROWS:]
+    column_values = body[:, col_index] # ff available for a given role
 
     if not all_ff_waiting: # standard case
-        selection = column_values[column_values > 0] # ff having the skill
-        if selection.size > 0: # any ff ?        
-            cond_met = np.where( (column_values > 0) & (np.all(state[2:, -3:] == 0, axis=1)) )[0] # ff having any skill lvl > 0
-            potential_skills = column_values[(column_values > 0) & (np.all(state[2:, -3:] == 0, axis=1))].tolist()
+        # One mask, used for both the indices and the levels. The two lines
+        # this replaces built `(column_values > 0) & np.all(...)` twice --
+        # `np.where(...)` for the indices and the same expression again to
+        # index `column_values` -- so the availability scan over the whole
+        # padded body ran twice per decision.
+        free = ~body[:, -N_AVAILABILITY_COLS:].any(axis=1)
+        feasible = (column_values > 0) & free
+        if feasible.any():
+            cond_met = np.flatnonzero(feasible)
+            potential_skills = column_values[feasible].tolist()
     else: # all ff waiting
-        selection = column_values # all ff to avoid the case of a ff losing his skills
-        if selection.size > 0: # any ff ?
-            cond_met = np.where( (state[2:, -2] == 1) )[0]                                               
-            cond_met = np.array([cond_met[0]]) # first ff because all ff waiting follows an order
-            
+        if column_values.size > 0: # any ff ?
+            # all ff to avoid the case of a ff losing his skills
+            cond_met = np.flatnonzero(body[:, -2] == 1)[:1]  # first ff: order matters
+
     if cond_met.size > 0:
         potential_actions = cond_met.tolist()
     else:
@@ -233,7 +274,7 @@ def get_potential_actions(state, all_ff_waiting):
     if all_ff_waiting:
         assert potential_actions == [0], "not action 0 and all_ff_waiting"
 
-        
+
     return potential_actions, potential_skills
 
 def get_v_availability(dic_vehicles, station):
@@ -596,6 +637,15 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
     date_reference = df_pc.iloc[0, 1]
     skills_updated = update_skills(df_skills, date_reference)
 
+    # Converted last: `constrain_ff` reads the nested dict to learn which
+    # station each firefighter serves, and nothing filters `planning` itself,
+    # so this is the first point where its contents are final. `PlanningView`
+    # keeps the four-level indexing the call sites use; the saving is that a
+    # copy shares every slot until it is written, instead of deep-copying
+    # 334,056 slot dicts (2.6 s) -- which is what makes parallel environments
+    # possible.
+    planning = PlanningView(SlotStore.from_planning(planning))
+
     return dic_vehicles, dic_functions, df_skills, dic_roles_skills, dic_roles, planning, \
     dic_inter, dic_ff, dic_indic, dic_indic_old, Z_1, Z_4, dic_lent, dic_station_distance, df_pc, \
     old_date, date_reference, skills_updated
@@ -654,73 +704,91 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     being filled.
     """
 
-    nb_roles = 37
+    # One buffer for the whole state, filled block by block, rather than eight
+    # `vstack`/`hstack`/`concatenate` calls each allocating and copying the
+    # whole thing again. The layout is fixed -- (action_size + 2) rows of
+    # `state_width()` -- so it can be zeroed once and written into, which also
+    # makes the two filler blocks disappear: padding is whatever was never
+    # written.
+    #
+    # Row 0 is rl_infos, row 1 the current-role one-hot, rows 2.. the
+    # candidates. Column order inside a candidate row is roles | rarity |
+    # availability, and `get_potential_actions` depends on availability being
+    # the last `N_AVAILABILITY_COLS`.
+    width = state_width()
+    state = np.zeros((st.action_size + N_HEADER_ROWS, width))
 
-    # ff skills
-    state = np.hstack(([get_roles_for_ff(veh, ff_array, st.dic_roles, st.dic_roles_skills) for veh in st.veh_depart])).astype(float)
+    role_end = N_ROLE_COLS
+    rarity_end = role_end + N_RARITY_COLS
 
-    state /= 8 # normalization, 8 skill lvls
+    n_ff = len(ff_existing)
+    body = state[N_HEADER_ROWS:]
 
+    # --- roles ---------------------------------------------------------
+    # `ff_array` is fixed for the decision, so its two comparisons are hoisted
+    # here and shared by every role of every vehicle instead of being rebuilt
+    # inside each `get_role_from_skills` call.
+    ff_masks = ff_match_operands(ff_array)
+    col = 0
+    for veh in st.veh_depart:
+        block = get_roles_for_ff(veh, ff_array, st.dic_roles,
+                                 st.dic_roles_skills, ff_masks)
+        rows, cols = block.shape
+        if col + cols > role_end:
+            # The old code sized this block from the data and padded to
+            # `N_ROLE_COLS`; writing into a fixed buffer would instead drop the
+            # overflow silently, feeding the policy a departure whose last
+            # vehicle has no roles. The widest vehicle in the table needs 6
+            # columns and a train is capped at 5, so 37 leaves real headroom --
+            # but the margin is small enough that a wider vehicle type should
+            # say so rather than be truncated.
+            raise ValueError(
+                f"departure needs {col + cols} role columns but N_ROLE_COLS is "
+                f"{role_end}: {st.veh_depart}"
+            )
+        # Written straight into the buffer, normalised in place: `state /= 8`
+        # used to walk the full padded matrix, most of which is zeros.
+        body[:rows, col:col + cols] = block
+        col += cols
+    body[:, :role_end] /= 8  # normalization, 8 skill lvls
 
-    # filler row
-    filler = np.zeros((st.action_size-state.shape[0], state.shape[1])) # max 74 de base + 6 ff lent
-    state = np.vstack((state, filler))
-
-    # filler col
-    filler = np.zeros((state.shape[0], nb_roles - state.shape[1]))
-    state = np.concatenate((state, filler), axis=1)
-
-    # Scarcity of each candidate, inserted *before* the availability block:
-    # `get_potential_actions` reads `state[2:, -3:]` to find which firefighters
-    # are free, so availability has to remain the last three columns.
+    # --- scarcity ------------------------------------------------------
+    # Kept *before* the availability block: `get_potential_actions` reads the
+    # last `N_AVAILABILITY_COLS` to find which firefighters are free.
     #
     # Without these the policy sees which roles a candidate can fill but not
     # whether anyone else could fill them, so it cannot tell a rare profile from
     # an interchangeable one and spends the rare ones first. The quantities were
     # already computed at every decision -- they were routed to the decision log
-    # instead of to the network. Zeros when the caller supplies nothing, which
-    # keeps the width fixed whether or not rarity is being fed.
+    # instead of to the network. Left zeroed when the caller supplies nothing,
+    # which keeps the width fixed whether or not rarity is being fed.
     rarity = getattr(st, "ff_rarity", None)
-    n_ff = len(ff_existing)
-    if rarity is None:
-        rarity_block = np.zeros((st.action_size, 3))
-    else:
-        rarity_block = np.vstack((
-            np.asarray(rarity, dtype=float)[:n_ff],
-            np.zeros((st.action_size - n_ff, 3)),
-        ))
-    state = np.hstack((state, rarity_block))
+    if rarity is not None and n_ff:
+        body[:n_ff, role_end:rarity_end] = np.asarray(rarity, dtype=float)[:n_ff]
 
-    # resp time
+    # --- availability --------------------------------------------------
     # `ff_existing` directly, not `df_skills.loc[ff_existing, :].index`: that
     # reindexed a 268-column frame to read back the very labels it was given,
     # at 168 us against 0.15 us, on every decision. The two are the same list --
     # `.loc` with a label list preserves order and repeats duplicates.
-    resp_time = np.array([st.dic_ff[f] for f in ff_existing])
-    resp_time_norm = np.where(resp_time < 0, 0.0, resp_time/st.max_duration) # normalization
-    mask_minus1 = (resp_time == -1)
-    mask_minus2 = (resp_time == -2)
-    resp_time_all = np.stack([resp_time_norm, mask_minus1, mask_minus2], axis=1)
+    if n_ff:
+        resp_time = np.fromiter((st.dic_ff[f] for f in ff_existing),
+                                dtype=float, count=n_ff)
+        avail = body[:n_ff, rarity_end:]
+        np.divide(resp_time, st.max_duration, out=avail[:, 0])
+        avail[resp_time < 0, 0] = 0.0
+        avail[:, 1] = (resp_time == -1)
+        avail[:, 2] = (resp_time == -2)
 
-    zero_rows = np.zeros(((st.action_size-len(ff_existing)), resp_time_all.shape[1]))
-    availability = np.vstack((resp_time_all, zero_rows))
+    # --- header rows ---------------------------------------------------
+    state[1, st.idx_role] = 1  # current role to fill
 
-    state = np.hstack((state, availability))
-
-    # current role to fill
-    current_role = [0]*state.shape[1]
-    current_role[st.idx_role] = 1
-    state = np.vstack((current_role, state))
-
-    # rl_infos + position + time
-
-    # Padded to the state's width rather than to a literal 22: the row has to
-    # match whatever the per-candidate block now is, and that grew by the three
-    # rarity columns.
+    # rl_infos + position + time. Sliced rather than padded to a literal 22:
+    # the row has to match whatever the per-candidate block now is, and that
+    # grew by the three rarity columns.
     rl_infos = (info_avail + [st.coord_x, st.coord_y, st.month_sin, st.month_cos,
                               st.day_sin, st.day_cos, st.hour_sin, st.hour_cos])
-    rl_infos = np.array(rl_infos + [0] * (state.shape[1] - len(rl_infos)))
-    state = np.vstack((rl_infos, state))
+    state[0, :len(rl_infos)] = rl_infos
 
     return state
 
@@ -803,21 +871,78 @@ def _start_hours(df):
     _START_HOUR_CACHE[key] = (ref, table)
     return table
 
-def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
-                   potential=None, potential_old=None, gamma=0.99):
+# The three reserve counters are read as *levels*, not deltas: a reward is
+# added while the level sits below the threshold, rather than when it crosses.
+# Named here because that makes them the one part of the reward that does not
+# telescope -- it accrues for as long as the condition holds -- and the
+# distinction is invisible at the call site.
+_RESERVE_THRESHOLDS = {'VSAV_disp': 2, 'FPT_disp': 2, 'EPA_disp': 1}
+
+# Departures numbered at or above this are reinforcement movements rather than
+# assignment decisions, and draw no reward. Same sentinel as the action space's
+# "no feasible firefighter", which it shares only by coincidence.
+_REWARD_NUM_D_LIMIT = 79
+
+
+def check_reward_weights(dic_indic, dic_tarif):
+    """Fail now if a counter has no weight, rather than when it first moves.
+
+    The old summation multiplied *every* counter by its weight, so a weight
+    file missing a key raised KeyError on the first decision. Skipping zero
+    deltas is what makes the breakdown cheap, but it also means a missing
+    weight now only surfaces when that particular counter happens to move --
+    which for a rare one can be hours into a run. Checking the whole table up
+    front keeps the old failure time without the per-decision cost.
+    """
+    missing = sorted(set(dic_indic) - set(dic_tarif))
+    if missing:
+        raise KeyError(
+            f"reward weights missing for {missing}; every counter in dic_indic "
+            f"needs one, even at 0"
+        )
+
+
+def reward_components(dic_indic, dic_indic_old, num_d, dic_tarif):
+    """The reward's terms, before they are summed.
+
+    `compute_reward` returns one float built from about 21 weighted indicator
+    deltas plus three reserve bonuses, so when a reward curve moves there is no
+    way to tell which term moved it. This returns `{name: contribution}` --
+    already weighted, so the values sum to exactly what `compute_reward`
+    returns -- and only for the terms that are non-zero, since almost all of
+    them are zero on any given decision.
+
+    Reserve bonuses are keyed with a `reserve:` prefix to keep them distinct
+    from the delta of the same counter.
+
+    Returns
+    -------
+    dict[str, float]
+        Non-zero contributions. Empty for a reinforcement movement.
+    """
+    if num_d >= _REWARD_NUM_D_LIMIT:
+        return {}
+
+    parts = {}
+    for key, value in dic_indic.items():
+        if key in _RESERVE_THRESHOLDS:
+            continue
+        delta = value - dic_indic_old[key]
+        if delta:
+            contribution = delta * dic_tarif[key]
+            if contribution:
+                parts[key] = contribution
+
+    for key, threshold in _RESERVE_THRESHOLDS.items():
+        if dic_indic[key] < threshold and dic_tarif[key]:
+            parts[f"reserve:{key}"] = dic_tarif[key]
+
+    return parts
+
+
+def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif, components=None):
     """
     Compute the reward for a decision step from indicator deltas and a tariff/weight dictionary.
-
-    Optional potential-based shaping is added when both `potential` and
-    `potential_old` are given: `gamma * potential - potential_old`, weighted by
-    `dic_tarif["shaping"]` if present. The indicator deltas below fire when a
-    departure is *cancelled*, but the choice that caused it -- spending the last
-    holder of a scarce skill on a role anyone could fill -- may have happened
-    hours and hundreds of decisions earlier, far outside any n-step return. A
-    potential over "rare skills still covered" moves that signal to the decision
-    that actually destroys the option. Ng, Harada and Russell (1999) show this
-    form leaves the optimal policy unchanged, so it biases learning speed, not
-    the objective being measured.
 
     Parameters
     ----------
@@ -829,6 +954,9 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
         Departure step number (used to apply step-specific weights in some setups).
     dic_tarif : dict
         Weight dictionary mapping indicator names (and possibly step keys) to scalar weights.
+    components : dict, optional
+        Filled with this step's non-zero contributions when given, so a caller
+        that wants the breakdown does not pay for it on every other decision.
 
     Returns
     -------
@@ -839,36 +967,15 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
     -----
     This helper is used in RL training/evaluation loops to transform operational indicators
     (vehicles sent, degraded departures, firefighter shortages, etc.) into a scalar objective.
+
+    Potential-based shaping is *not* applied here. It needs the potentials of
+    two consecutive states, and only `PendingTransition` holds both; adding it
+    here as well would double-count.
     """
-
-    reward = 0
-
-    if num_d < 79:
-
-        dic_delta = {key:(dic_indic[key] - dic_indic_old[key]) for key in dic_indic if key not in ['VSAV_disp', 'FPT_disp', 'EPA_disp']}
-
-        for m in dic_delta:
-
-            reward += dic_delta[m] * dic_tarif[m]
-
-        
-        if dic_indic['VSAV_disp'] < 2:
-            reward += dic_tarif['VSAV_disp']
-    
-        if dic_indic['FPT_disp'] < 2:
-            reward += dic_tarif['FPT_disp']
-    
-        if dic_indic['EPA_disp'] < 1:
-            reward += dic_tarif['EPA_disp']
-
-    # Outside the `num_d < 79` guard: the shaping term telescopes over the
-    # trajectory, and skipping it on some steps would break that and leave a
-    # residual bias.
-    if potential is not None and potential_old is not None:
-        reward += dic_tarif.get('shaping', 1.0) * (gamma * potential - potential_old)
-
-
-    return reward
+    parts = reward_components(dic_indic, dic_indic_old, num_d, dic_tarif)
+    if components is not None:
+        components.update(parts)
+    return sum(parts.values())
 
 def step(st, action, ff_existing, num_role, all_roles_found, skill_lvl):
     """
@@ -1136,45 +1243,52 @@ def update_dict(dic, k):
 _ROLE_MASK_CACHE = {}
 
 
-def _role_masks(required_skills):
-    """The three broadcast-ready comparisons of a role's constraint vector.
+def _role_operands(required_skills):
+    """A role's constraint vector, prepared for the matmul compatibility test.
 
-    `get_role_from_skills` recomputed `required_skills == -1/1/0` on every call
-    -- 90,342 times per 4,000 interventions -- although the constraint vectors
-    come from `dic_roles_skills`, which is built once in
-    `generate_dic_roles_skills` and never mutated afterwards. There are only 116
-    of them, so the same handful of comparisons was being redone tens of
-    thousands of times.
+    Per constraint matrix (one row per skill level): `plus = (required == 1)`
+    and `minus = (required == -1)` as float32, and `base`, each level's total
+    number of constraints. `get_role_from_skills` counts violations as
+    `base - plus @ F1 - minus @ F0`; see there for why this replaces the
+    boolean broadcast.
 
-    Keyed by array identity, which is safe here precisely because the vectors
+    float32 rather than int: the matmuls then go through BLAS, and every value
+    involved is a small integer (at most 2 x 134), far inside float32's exact
+    range, so the counts are exact and `== 0` is a safe test.
+
+    Cached by array identity, which is safe here precisely because the vectors
     are immutable in practice; the arrays are marked read-only on first use so
-    a future in-place edit fails loudly instead of silently serving stale masks.
-    Held behind a weakref so a discarded role table does not stay alive.
+    a future in-place edit fails loudly instead of silently serving stale
+    operands. Held behind a weakref so a discarded role table does not stay
+    alive. (The cache also fixed a repetition cost: these vectors come from
+    `dic_roles_skills`, built once and never mutated, yet were being
+    re-compared 90,342 times per 4,000 interventions.)
     """
     key = id(required_skills)
     cached = _ROLE_MASK_CACHE.get(key)
     if cached is not None and cached[0]() is required_skills:
         return cached[1]
 
-    masks = ((required_skills == -1)[:, np.newaxis, :],
-             (required_skills == 1)[:, np.newaxis, :],
-             (required_skills == 0)[:, np.newaxis, :])
+    plus = (required_skills == 1).astype(np.float32)
+    minus = (required_skills == -1).astype(np.float32)
+    base = (plus.sum(axis=1) + minus.sum(axis=1))[:, np.newaxis]
+    operands = (plus, minus, base)
 
     try:
         required_skills.flags.writeable = False
     except (AttributeError, ValueError):
-        return masks              # a view we may not lock: correct, just uncached
+        return operands           # a view we may not lock: correct, just uncached
 
     try:
         ref = weakref.ref(required_skills,
                           lambda _, k=key: _ROLE_MASK_CACHE.pop(k, None))
     except TypeError:
-        return masks
-    _ROLE_MASK_CACHE[key] = (ref, masks)
-    return masks
+        return operands
+    _ROLE_MASK_CACHE[key] = (ref, operands)
+    return operands
 
 
-def get_role_from_skills(required_skills, ff_array):
+def get_role_from_skills(required_skills, ff_array, ff_masks=None):
 
     """
     Find the first role index compatible with a given firefighter's skills for a vehicle.
@@ -1187,6 +1301,12 @@ def get_role_from_skills(required_skills, ff_array):
         List of required-skill vectors for each role of the vehicle.
     mandatory : int
         Number of mandatory roles (used to determine degradation thresholds).
+    ff_masks : tuple[numpy.ndarray, numpy.ndarray], optional
+        Precomputed `ff_match_operands(ff_array)`. `ff_array` is fixed for a
+        whole decision while this runs once per role of every vehicle in the
+        departure -- roughly 37 times -- so recomputing the pair here would
+        redo the same work 37 times per decision. `gen_state` hoists them; the
+        default keeps direct callers working.
 
     Returns
     -------
@@ -1194,15 +1314,36 @@ def get_role_from_skills(required_skills, ff_array):
         (role_idx, skill_lvl)
         - role_idx: index of the first compatible role (or a sentinel if none)
         - skill_lvl: compatibility/gradation level for that assignment
+
+    Notes
+    -----
+    A (level, firefighter) pair is compatible when every skill constraint
+    holds: `required == 1` needs `ff == 1`, `required == -1` needs `ff == 0`,
+    `required == 0` accepts anything. This used to be tested literally, by
+    materialising three boolean arrays of shape (levels, n_ff, 134) per call
+    -- ~86k booleans per role, ~37 roles per decision -- which profiling
+    showed to be the simulation's dominant compute cost.
+
+    Counting *violations* says the same thing in two small matmuls:
+
+        V[l, f] = sum_s  plus[l, s] * (1 - F1[f, s])
+                       + minus[l, s] * (1 - F0[f, s])
+                = base[l] - (plus @ F1.T)[l, f] - (minus @ F0.T)[l, f]
+
+    and a pair is compatible iff V == 0. Built from the `== 1` / `== 0` masks
+    of `ff_array`, not its raw values, so an out-of-range entry disqualifies
+    exactly as it did under the boolean test. All quantities are small exact
+    integers in float32, so `== 0` is exact.
     """
 
-    matches_minus_one, matches_one, matches_zero_or_any = _role_masks(required_skills)
+    plus, minus, base = _role_operands(required_skills)
 
-    conditions_met = ((matches_minus_one & (ff_array == 0)[np.newaxis, :, :]) |
-                      (matches_one & (ff_array == 1)[np.newaxis, :, :]) |
-                      matches_zero_or_any)
+    if ff_masks is None:
+        ff_masks = ff_match_operands(ff_array)
+    f_zero_t, f_one_t = ff_masks
 
-    conditions_met = np.all(conditions_met, axis=2)
+    violations = base - plus @ f_one_t - minus @ f_zero_t
+    conditions_met = violations == 0
 
     first_valid_index = np.argmax(conditions_met, axis=0) +1
 
@@ -1210,7 +1351,18 @@ def get_role_from_skills(required_skills, ff_array):
 
     return first_valid_index
 
-def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills):
+
+def ff_match_operands(ff_array):
+    """`(ff == 0, ff == 1)` transposed to float32, ready for the violation matmul.
+
+    Split out so one decision computes them once and every role reuses them.
+    Transposed and made contiguous here, so the 37 matmuls that consume them
+    hit BLAS's fast path instead of each paying for the layout.
+    """
+    return (np.ascontiguousarray((ff_array == 0).T, dtype=np.float32),
+            np.ascontiguousarray((ff_array == 1).T, dtype=np.float32))
+
+def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills, ff_masks=None):
 
     """
     Compute compatible roles (and skill levels) for each firefighter for each vehicle in the departure list.
@@ -1240,7 +1392,13 @@ def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills):
     
     # required_roles = [role if role in dic_roles_skills else 'EQ_ENG_SAP' for role in required_roles]
 
-    return np.column_stack([get_role_from_skills(dic_roles_skills[role], ff_array).reshape(-1, 1) for role in required_roles])
+    if ff_masks is None:
+        ff_masks = ff_match_operands(ff_array)
+
+    return np.column_stack([
+        get_role_from_skills(dic_roles_skills[role], ff_array, ff_masks).reshape(-1, 1)
+        for role in required_roles
+    ])
 
 def distance_euclidienne(x1, y1, x2, y2):
     """
