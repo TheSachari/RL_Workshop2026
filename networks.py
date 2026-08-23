@@ -360,14 +360,19 @@ class Dueling_QNetwork(nn.Module):
 
 class QVN(nn.Module):
     """Quantile Value Network"""
-    def __init__(self, state_size, action_size,layer_size, AM, n_steps, device, seed, N, num_layers, layer_type, use_batchnorm):
+    def __init__(self, state_size, action_size,layer_size, AM, n_steps, device, seed, N, num_layers, layer_type, use_batchnorm,
+                 pointer=False):
         """
           init  .
-        
+
         Parameters
         ----------
-        See function/class signature.
-        
+        pointer : bool
+            Score candidates with a `PointerHead` instead of flattening the
+            attention output into a slot-indexed `Linear(.., action_size)`.
+            Requires `AM`, since it consumes the attention embeddings. Off by
+            default: it is a different network, and weights do not transfer.
+
         Returns
         -------
         See implementation.
@@ -382,6 +387,10 @@ class QVN(nn.Module):
         self.use_batchnorm = use_batchnorm
         self.AM = AM
         self.N = N
+        if pointer and not AM:
+            raise ValueError("pointer=True needs AM=True: it scores the "
+                             "attention embeddings, which only AM produces")
+        self.pointer = pointer
         self.n_cos = 64
         self.pis = torch.FloatTensor([np.pi*i for i in range(1, self.n_cos+1)]).view(1,1,self.n_cos).to(device)
         self.device = device
@@ -411,7 +420,14 @@ class QVN(nn.Module):
     
             # Standard NN
     
-            self.emb_state_size = self.d_model * (self.action_size + 2)            
+            if self.pointer:
+                # The head sees only the context -- the two header rows -- and
+                # the candidates are scored individually by `PointerHead`, so
+                # its input no longer grows with `action_size`.
+                self.emb_state_size = self.d_model * 2
+                self.pointer_head = PointerHead(self.d_model, layer_size)
+            else:
+                self.emb_state_size = self.d_model * (self.action_size + 2)
             layer.append(nn.Linear(self.emb_state_size, layer_size))
 
 
@@ -457,7 +473,12 @@ class QVN(nn.Module):
             self.ff_1_V = nn.Linear(layer_size, layer_size)
             self.bn_A = nn.BatchNorm1d(layer_size)
             self.bn_V = nn.BatchNorm1d(layer_size)
-            self.advantage = nn.Linear(layer_size,action_size)
+            # The pointer scores from the candidate embeddings, so the
+            # slot-indexed advantage layer is never called -- allocating it
+            # would put action_size x layer_size dead parameters into the
+            # checkpoint and the optimiser state.
+            if not self.pointer:
+                self.advantage = nn.Linear(layer_size,action_size)
             self.value = nn.Linear(layer_size,1)
             weight_init([self.model,self.ff_1_A, self.ff_1_V])  
  
@@ -554,11 +575,21 @@ class QVN(nn.Module):
         ff_state = state[:, 2:, :]
 
         attn_output = self.attention(ff_state)
-        x_flat = attn_output.flatten(start_dim=1)
 
         infos_vec = self.infos_encoder(infos_line)
         role_vec = self.role_encoder(role_line)
 
+        if self.pointer:
+            # Only the context goes through the head; the candidates stay a
+            # set, to be scored one at a time. Flattening them here is exactly
+            # what ties the network to slot position. The embeddings are
+            # returned rather than stashed on `self`, so two forwards -- the
+            # local and target networks, or two threads -- cannot overwrite
+            # each other's.
+            context = self.head(torch.cat([infos_vec, role_vec], dim=1))
+            return context, attn_output
+
+        x_flat = attn_output.flatten(start_dim=1)
         x = torch.cat([infos_vec, role_vec, x_flat], dim=1)
         x = self.head(x)
         return x
@@ -577,11 +608,16 @@ class QVN(nn.Module):
         See implementation.
         """
 
-        x = self._encode_state(state)
+        encoded = self._encode_state(state)
+        if self.pointer:
+            context, entities = encoded
+            # The entities ride along so `get_quantiles` can score them; the
+            # FQF agent passes this straight back as its `embedding`.
+            return self.model(context), entities
 
-        return self.model(x)
-        
-    def get_quantiles(self, x, taus, embedding=None):
+        return self.model(encoded)
+
+    def get_quantiles(self, x, taus, embedding=None, entities=None):
 
         """
         Get quantiles.
@@ -596,10 +632,13 @@ class QVN(nn.Module):
         """
 
         if embedding is None:
-            x = self.head(x)
+            if self.pointer:
+                x, entities = self._encode_state(x)
+            else:
+                x = self.head(x)
         else:
             x = embedding
-            
+
         batch_size = x.shape[0]
         num_tau = taus.shape[1]
         cos = self.calc_cos(taus) # cos shape (batch, num_tau, layer_size)
@@ -619,7 +658,21 @@ class QVN(nn.Module):
 
         value = self.value(x_V)
         # value = value.expand(state.size(0), self.action_size)
-        advantage = self.advantage(x_A)
+        if self.pointer:
+            if entities is None:
+                raise ValueError(
+                    "pointer=True needs the candidate embeddings; pass "
+                    "`entities` alongside a precomputed `embedding`"
+                )
+            # One score per candidate, from that candidate's own embedding.
+            # `x_A` is (batch * num_tau, layer) while the entities are one set
+            # per *state*, so each set is repeated across its taus.
+            n_candidates = entities.shape[1]
+            repeated = entities.repeat_interleave(num_tau, dim=0)
+            advantage = self.pointer_head(repeated, x_A)
+        else:
+            n_candidates = self.action_size
+            advantage = self.advantage(x_A)
 
         if self.use_batchnorm:
             Q = value + advantage - advantage.mean(dim=1, keepdim=True)
@@ -627,7 +680,7 @@ class QVN(nn.Module):
             Q = value + advantage - advantage.mean()
         # return Q
 
-        return Q.view(batch_size, num_tau, self.action_size)
+        return Q.view(batch_size, num_tau, n_candidates)
     
     
 
@@ -724,6 +777,64 @@ class Attention(nn.Module):
         output = self.norm(attn_output + x_embed)  # résiduel + normalisation
         return output # .squeeze(0)  # [n_pompiers, d_model]
 
+
+
+class PointerHead(nn.Module):
+    """Scores each candidate from its own embedding, not from its slot index.
+
+    The AM path ends in `attention(ff_state).flatten(start_dim=1)` followed by
+    `Linear(layer_size, action_size)`. Attention is permutation-equivariant, so
+    the embeddings themselves carry no positional meaning -- but the flatten
+    concatenates them in slot order and the head then learns one weight vector
+    per slot. The result is that "the firefighter in position 3" is a thing the
+    network can represent, when positions come from whatever order
+    `_resolve_crew` happened to build `ff_existing` in.
+
+    Two consequences. The model cannot generalise to a different roster size,
+    because `action_size` is baked into the output layer. And it has to learn
+    invariance that the problem already has, from data, instead of being built
+    with it.
+
+    A pointer scores candidate *i* from candidate *i*'s embedding and a context
+    vector shared by the decision:
+
+        score_i = w . tanh(W_c context + W_e embedding_i)
+
+    which is Bahdanau attention used as a pointer (Vinyals et al., 2015). It is
+    permutation-equivariant by construction -- reorder the candidates and the
+    scores follow -- and it takes any number of them, because the parameters
+    are per-*feature*, never per-slot.
+
+    Kept as its own module so the flatten path stays reachable: the two produce
+    different networks, and a checkpoint from one will not load into the other.
+    """
+
+    def __init__(self, d_model: int, context_size: int, hidden: int = 128):
+        super().__init__()
+        self.context_proj = nn.Linear(context_size, hidden)
+        self.entity_proj = nn.Linear(d_model, hidden)
+        self.score = nn.Linear(hidden, 1)
+
+    def forward(self, entities: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        entities : torch.Tensor
+            `[B, N, d_model]` -- one embedding per candidate.
+        context : torch.Tensor
+            `[B, context_size]` -- the decision's shared state.
+
+        Returns
+        -------
+        torch.Tensor
+            `[B, N]` scores, one per candidate, in the order given.
+        """
+        # `unsqueeze(1)` broadcasts the one context across the N candidates,
+        # which is what makes the same parameters serve any N.
+        joint = torch.tanh(
+            self.context_proj(context).unsqueeze(1) + self.entity_proj(entities)
+        )
+        return self.score(joint).squeeze(-1)
 
 
 class FirefighterEncoder(nn.Module):

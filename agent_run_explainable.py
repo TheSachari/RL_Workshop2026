@@ -86,6 +86,7 @@ if __name__ == "__main__":
     # decision log; these expose it to the policy and to the reward.
     parser.add_argument("--rarity_features", action="store_true", help="feed per-candidate scarcity (locally rare / irreversible / upcoming) to the network")
     parser.add_argument("--shaping_coeff", type=float, default=0.0, help="weight of potential-based shaping on rare skills still covered (0 disables)")
+    parser.add_argument("--pointer", action="store_true", help="score candidates from their own embeddings instead of a slot-indexed head (permutation-invariant, roster-size independent; not weight-compatible with the default head)")
     parser.add_argument("--reward_weights", type=str, help="JSON file with reward weights")
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     if args.agent_model == "dqn":
         agent = DQNAgent(**hyper_params)
     elif args.agent_model == "fqf":
-        agent = FQFAgent(**hyper_params)
+        agent = FQFAgent(**hyper_params, pointer=args.pointer)
     elif args.agent_model == "ppo":
         agent = PPOAgent(**hyper_params)
     else:
