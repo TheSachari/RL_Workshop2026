@@ -43,13 +43,20 @@ import torch
 
 import checkpoint as ckpt
 from agent_explainable import DQNAgent, FQFAgent, PPOAgent
-from collective_functions import DEFAULT_SEED, compute_reward, load_environment
+from collective_functions import (
+    DEFAULT_SEED,
+    N_HEADER_ROWS,
+    compute_reward,
+    load_environment,
+    state_size_for,
+    state_width,
+)
 from decision_log import DecisionLog, rarest_skills
 from explainability import (
     get_dic_rare_skills,
     get_related_rows_in_time,
-    rare_skills_for_step,
     irreversible_spent_by,
+    rare_skills_for_step,
     rare_skills_still_covered,
     rarity_features,
 )
@@ -103,6 +110,20 @@ if __name__ == "__main__":
 
     with open(resolve(args.hyper_params, DATA), "r") as f:
         hyper_params = json.load(f)
+
+    # A `state_size` that disagrees with what `gen_state` builds does not fail
+    # here -- it fails several minutes in, at the first forward pass, as a
+    # reshape error quoting two lengths and naming neither the config nor the
+    # block that moved. Checked up front instead, against the one derivation.
+    expected_state_size = state_size_for(hyper_params["action_size"])
+    if hyper_params["state_size"] != expected_state_size:
+        raise SystemExit(
+            f"{args.hyper_params}: state_size is {hyper_params['state_size']}, "
+            f"but action_size {hyper_params['action_size']} with the current "
+            f"state layout gives {expected_state_size} "
+            f"({hyper_params['action_size']} + {N_HEADER_ROWS} rows x "
+            f"{state_width()} features). Update the config."
+        )
 
     device = torch.device(hyper_params["device"])
     # Off by default: anomaly mode records a stack trace for every autograd op

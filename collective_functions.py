@@ -33,6 +33,41 @@ from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F4
 # across replicates; the default keeps a plain run reproducible.
 DEFAULT_SEED = 42
 
+# --- state geometry -------------------------------------------------------
+#
+# `gen_state` lays each candidate out as one row of three concatenated blocks,
+# and the network's attention module reads the state back as
+# (action_size + 2) rows of `state_width()`. The two have to agree, but the
+# width lived as a literal 37 inside `gen_state` and a literal 3280 in every
+# hyper-parameter file, so adding the rarity block silently desynchronised
+# them: the network kept deriving d_input = 3280 // 82 = 40 while the state
+# arrived 43 wide, and the mismatch only surfaced as a reshape error at the
+# first forward pass -- one that reports lengths, not which block moved.
+#
+# They are named here so a block can only be resized in one place, and
+# `state_size_for` gives callers the number to check a config against.
+N_ROLE_COLS = 37       # role-compatibility columns, one per role
+N_RARITY_COLS = 3      # locally rare / irreversible / upcoming, per candidate
+N_AVAILABILITY_COLS = 3  # normalised response time + the two sentinel masks
+
+# Rows the state carries above the per-candidate block: the rl_infos line and
+# the current-role one-hot.
+N_HEADER_ROWS = 2
+
+
+def state_width():
+    """Feature width of one state row — what the network calls `d_input`."""
+    return N_ROLE_COLS + N_RARITY_COLS + N_AVAILABILITY_COLS
+
+
+def state_size_for(action_size):
+    """Flattened state length for a given action size.
+
+    This is the `state_size` a hyper-parameter file has to declare. Deriving it
+    is what keeps a config from disagreeing with `gen_state`.
+    """
+    return (action_size + N_HEADER_ROWS) * state_width()
+
 # Skill validity windows, split out of the skills table once per table. Keyed by
 # `id(df_skills)` and holding a *weak* reference to it, so a recycled id cannot
 # be mistaken for a hit and per-decision views are not pinned for the whole run
@@ -654,7 +689,7 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     being filled.
     """
 
-    nb_roles = 37
+    nb_roles = N_ROLE_COLS
 
     # ff skills
     state = np.hstack(([get_roles_for_ff(veh, ff_array, st.dic_roles, st.dic_roles_skills) for veh in st.veh_depart])).astype(float)
@@ -683,11 +718,11 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     rarity = getattr(st, "ff_rarity", None)
     n_ff = len(ff_existing)
     if rarity is None:
-        rarity_block = np.zeros((st.action_size, 3))
+        rarity_block = np.zeros((st.action_size, N_RARITY_COLS))
     else:
         rarity_block = np.vstack((
             np.asarray(rarity, dtype=float)[:n_ff],
-            np.zeros((st.action_size - n_ff, 3)),
+            np.zeros((st.action_size - n_ff, N_RARITY_COLS)),
         ))
     state = np.hstack((state, rarity_block))
 
