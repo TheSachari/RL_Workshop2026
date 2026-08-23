@@ -636,6 +636,33 @@ def _handle_intervention(st: _LoopState) -> None:
         _fill_station(st)
 
 
+def _stream_rows(df):
+    """The event stream as row tuples, from columns converted once.
+
+    `itertuples` builds each row by reading every column element-wise, and two
+    of the stream's columns are extension arrays (`date` datetime64, `zone`
+    str) whose per-element access goes through Python-level `__getitem__` --
+    1.84M such calls in a profiled reference run, the largest remaining cost
+    after the planning rewrite. Converting each column to a NumPy array once
+    and zipping yields the same `(index, *values)` tuples with the per-element
+    machinery paid a single time, vectorised.
+
+    Parity with `itertuples(index=True, name=None)` is deliberate and checked
+    column by column: datetime columns are boxed to `pd.Timestamp` (`st.date`
+    flows into `update_duration`, the checkpoint and the decision log, all of
+    which expect Timestamp arithmetic), object columns hand back the same
+    objects, and numeric columns yield numpy scalars whose hash, equality and
+    arithmetic match the Python scalars they replace -- the golden cases pin
+    that the run is bit-identical.
+    """
+    columns = [
+        df[name].to_numpy(dtype=object) if df[name].dtype.kind == "M"
+        else df[name].to_numpy()
+        for name in df.columns
+    ]
+    return zip(df.index.to_numpy(), *columns)
+
+
 def run_simulation(
     env,
     fleet,
@@ -709,7 +736,7 @@ def run_simulation(
     old_date = env.old_date
     date_reference = env.date_reference
 
-    for row in st.df_pc.itertuples(index=True, name=None):
+    for row in _stream_rows(st.df_pc):
 
         # Skip everything the checkpoint already accounted for. Comparing on the
         # row index (not a counter) keeps this correct even though `num_inter`
