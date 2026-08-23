@@ -122,3 +122,82 @@ def test_reward_weights_from_a_real_file_shape():
     new = indicators(v_degraded=2, v_sent_full=1)
     weights = tariffs(v_degraded=-100, v_sent_full=10)
     assert compute_reward(new, old, 1, weights) == 2 * -100 + 1 * 10
+
+
+class TestComponents:
+    """The breakdown must reconstruct the scalar exactly, or it is misleading."""
+
+    def test_components_sum_to_the_reward(self):
+        old = indicators()
+        new = indicators(v_degraded=2, v_sent_full=1, rupture_ff=3)
+        weights = tariffs(v_degraded=-100, v_sent_full=10, rupture_ff=-5)
+
+        parts = {}
+        reward = compute_reward(new, old, 1, weights, components=parts)
+
+        assert sum(parts.values()) == reward
+
+    def test_components_are_weighted_not_raw_deltas(self):
+        old = indicators()
+        new = indicators(v_degraded=2)
+        parts = {}
+        compute_reward(new, old, 1, tariffs(v_degraded=-100), components=parts)
+        assert parts == {"v_degraded": -200}
+
+    def test_only_non_zero_terms_appear(self):
+        """Most counters do not move on a given decision; they must not be listed."""
+        old = indicators()
+        new = indicators(rupture_ff=1)
+        parts = {}
+        compute_reward(new, old, 1, tariffs(rupture_ff=-100), components=parts)
+        assert list(parts) == ["rupture_ff"]
+
+    def test_a_moved_counter_with_zero_weight_is_omitted(self):
+        old = indicators()
+        new = indicators(v_sent=5)
+        parts = {}
+        compute_reward(new, old, 1, tariffs(), components=parts)
+        assert parts == {}
+
+    def test_reserve_bonuses_are_keyed_apart_from_the_delta(self):
+        """`VSAV_disp` names both a level bonus and a counter; they must not collide."""
+        state = indicators(VSAV_disp=0)
+        parts = {}
+        compute_reward(state, dict(state), 1, tariffs(VSAV_disp=-10), components=parts)
+        assert parts == {"reserve:VSAV_disp": -10}
+
+    def test_reinforcement_movements_have_no_components(self):
+        old = indicators()
+        new = indicators(rupture_ff=1)
+        parts = {}
+        reward = compute_reward(new, old, 79, tariffs(rupture_ff=-100),
+                                components=parts)
+        assert parts == {} and reward == 0
+
+    def test_components_is_optional(self):
+        old = indicators()
+        new = indicators(rupture_ff=1)
+        assert compute_reward(new, old, 1, tariffs(rupture_ff=-100)) == -100
+
+
+class TestWeightValidation:
+    """A missing weight must fail at startup, not hours in when a rare counter moves."""
+
+    def test_missing_weight_is_reported(self):
+        from collective_functions import check_reward_weights
+
+        weights = tariffs()
+        del weights["rupture_ff"]
+        with pytest.raises(KeyError, match="rupture_ff"):
+            check_reward_weights(indicators(), weights)
+
+    def test_complete_weights_pass(self):
+        from collective_functions import check_reward_weights
+
+        check_reward_weights(indicators(), tariffs())
+
+    def test_extra_weights_are_allowed(self):
+        """Weight files may carry keys the indicator set does not use."""
+        from collective_functions import check_reward_weights
+
+        check_reward_weights(indicators(), tariffs(shaping=1.0))

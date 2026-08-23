@@ -46,6 +46,7 @@ from agent_explainable import DQNAgent, FQFAgent, PPOAgent
 from collective_functions import (
     DEFAULT_SEED,
     N_HEADER_ROWS,
+    check_reward_weights,
     compute_reward,
     load_environment,
     state_size_for,
@@ -179,6 +180,11 @@ if __name__ == "__main__":
     env = load_environment(args.constraint_factor_veh, args.constraint_factor_ff,
                            args.dataset, args.start, args.end, args.seed)
 
+    # Up front, not on the decision that first moves an unweighted counter:
+    # skipping zero deltas is what keeps the breakdown cheap, but it also means
+    # a weight file missing a rare counter would otherwise run for hours first.
+    check_reward_weights(env.dic_indic, dic_tarif)
+
     # Reinforcement bookkeeping for VSAV/FPT/EPA. Field defaults match the
     # flat initialisation this replaces ("" / False / 0).
     fleet = Fleet()
@@ -198,6 +204,9 @@ if __name__ == "__main__":
     pending = PendingTransition(gamma=agent.gamma,
                                 shaping_coeff=args.shaping_coeff)
     reward_evo = []
+    # Cumulative contribution of each reward term, saved alongside the curve so
+    # a run's reward can be attributed rather than just plotted.
+    reward_parts = {}
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
     # Scoped rarity is constant within an hour for a given (station,
@@ -347,7 +356,16 @@ if __name__ == "__main__":
 
     def on_action(ctx):
         """Reward is the indicator delta, read before dic_indic_old is refreshed."""
-        reward = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d, dic_tarif)
+        # Accumulated per term as well as summed: a moving reward curve
+        # otherwise gives no way to tell which of the ~21 counters moved it.
+        # `parts` holds only the non-zero terms, which on most decisions is
+        # none, so this costs a dict update rather than a full pass.
+        parts = {}
+        reward = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d,
+                                dic_tarif, components=parts)
+        for name, value in parts.items():
+            reward_parts[name] = reward_parts.get(name, 0.0) + value
+
         pending.add_reward(reward)
         rl["score"] += reward
         rl["action_num"] += 1
@@ -387,6 +405,7 @@ if __name__ == "__main__":
             (metrics_path, env.dic_indic),
             (curves_path, {"num_inter": num_inter,
                            "reward_evo": reward_evo,
+                           "reward_parts": reward_parts,
                            "dic_saved_skills": dic_saved_skills}),
         ):
             tmp = path.with_suffix(path.suffix + ".tmp")

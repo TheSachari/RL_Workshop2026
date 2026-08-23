@@ -861,21 +861,78 @@ def _start_hours(df):
     _START_HOUR_CACHE[key] = (ref, table)
     return table
 
-def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
-                   potential=None, potential_old=None, gamma=0.99):
+# The three reserve counters are read as *levels*, not deltas: a reward is
+# added while the level sits below the threshold, rather than when it crosses.
+# Named here because that makes them the one part of the reward that does not
+# telescope -- it accrues for as long as the condition holds -- and the
+# distinction is invisible at the call site.
+_RESERVE_THRESHOLDS = {'VSAV_disp': 2, 'FPT_disp': 2, 'EPA_disp': 1}
+
+# Departures numbered at or above this are reinforcement movements rather than
+# assignment decisions, and draw no reward. Same sentinel as the action space's
+# "no feasible firefighter", which it shares only by coincidence.
+_REWARD_NUM_D_LIMIT = 79
+
+
+def check_reward_weights(dic_indic, dic_tarif):
+    """Fail now if a counter has no weight, rather than when it first moves.
+
+    The old summation multiplied *every* counter by its weight, so a weight
+    file missing a key raised KeyError on the first decision. Skipping zero
+    deltas is what makes the breakdown cheap, but it also means a missing
+    weight now only surfaces when that particular counter happens to move --
+    which for a rare one can be hours into a run. Checking the whole table up
+    front keeps the old failure time without the per-decision cost.
+    """
+    missing = sorted(set(dic_indic) - set(dic_tarif))
+    if missing:
+        raise KeyError(
+            f"reward weights missing for {missing}; every counter in dic_indic "
+            f"needs one, even at 0"
+        )
+
+
+def reward_components(dic_indic, dic_indic_old, num_d, dic_tarif):
+    """The reward's terms, before they are summed.
+
+    `compute_reward` returns one float built from about 21 weighted indicator
+    deltas plus three reserve bonuses, so when a reward curve moves there is no
+    way to tell which term moved it. This returns `{name: contribution}` --
+    already weighted, so the values sum to exactly what `compute_reward`
+    returns -- and only for the terms that are non-zero, since almost all of
+    them are zero on any given decision.
+
+    Reserve bonuses are keyed with a `reserve:` prefix to keep them distinct
+    from the delta of the same counter.
+
+    Returns
+    -------
+    dict[str, float]
+        Non-zero contributions. Empty for a reinforcement movement.
+    """
+    if num_d >= _REWARD_NUM_D_LIMIT:
+        return {}
+
+    parts = {}
+    for key, value in dic_indic.items():
+        if key in _RESERVE_THRESHOLDS:
+            continue
+        delta = value - dic_indic_old[key]
+        if delta:
+            contribution = delta * dic_tarif[key]
+            if contribution:
+                parts[key] = contribution
+
+    for key, threshold in _RESERVE_THRESHOLDS.items():
+        if dic_indic[key] < threshold and dic_tarif[key]:
+            parts[f"reserve:{key}"] = dic_tarif[key]
+
+    return parts
+
+
+def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif, components=None):
     """
     Compute the reward for a decision step from indicator deltas and a tariff/weight dictionary.
-
-    Optional potential-based shaping is added when both `potential` and
-    `potential_old` are given: `gamma * potential - potential_old`, weighted by
-    `dic_tarif["shaping"]` if present. The indicator deltas below fire when a
-    departure is *cancelled*, but the choice that caused it -- spending the last
-    holder of a scarce skill on a role anyone could fill -- may have happened
-    hours and hundreds of decisions earlier, far outside any n-step return. A
-    potential over "rare skills still covered" moves that signal to the decision
-    that actually destroys the option. Ng, Harada and Russell (1999) show this
-    form leaves the optimal policy unchanged, so it biases learning speed, not
-    the objective being measured.
 
     Parameters
     ----------
@@ -887,6 +944,9 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
         Departure step number (used to apply step-specific weights in some setups).
     dic_tarif : dict
         Weight dictionary mapping indicator names (and possibly step keys) to scalar weights.
+    components : dict, optional
+        Filled with this step's non-zero contributions when given, so a caller
+        that wants the breakdown does not pay for it on every other decision.
 
     Returns
     -------
@@ -897,36 +957,15 @@ def compute_reward(dic_indic, dic_indic_old, num_d, dic_tarif,
     -----
     This helper is used in RL training/evaluation loops to transform operational indicators
     (vehicles sent, degraded departures, firefighter shortages, etc.) into a scalar objective.
+
+    Potential-based shaping is *not* applied here. It needs the potentials of
+    two consecutive states, and only `PendingTransition` holds both; adding it
+    here as well would double-count.
     """
-
-    reward = 0
-
-    if num_d < 79:
-
-        dic_delta = {key:(dic_indic[key] - dic_indic_old[key]) for key in dic_indic if key not in ['VSAV_disp', 'FPT_disp', 'EPA_disp']}
-
-        for m in dic_delta:
-
-            reward += dic_delta[m] * dic_tarif[m]
-
-        
-        if dic_indic['VSAV_disp'] < 2:
-            reward += dic_tarif['VSAV_disp']
-    
-        if dic_indic['FPT_disp'] < 2:
-            reward += dic_tarif['FPT_disp']
-    
-        if dic_indic['EPA_disp'] < 1:
-            reward += dic_tarif['EPA_disp']
-
-    # Outside the `num_d < 79` guard: the shaping term telescopes over the
-    # trajectory, and skipping it on some steps would break that and leave a
-    # residual bias.
-    if potential is not None and potential_old is not None:
-        reward += dic_tarif.get('shaping', 1.0) * (gamma * potential - potential_old)
-
-
-    return reward
+    parts = reward_components(dic_indic, dic_indic_old, num_d, dic_tarif)
+    if components is not None:
+        components.update(parts)
+    return sum(parts.values())
 
 def step(st, action, ff_existing, num_role, all_roles_found, skill_lvl):
     """
