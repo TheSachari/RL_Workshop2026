@@ -728,7 +728,7 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     # `ff_array` is fixed for the decision, so its two comparisons are hoisted
     # here and shared by every role of every vehicle instead of being rebuilt
     # inside each `get_role_from_skills` call.
-    ff_masks = ff_broadcast_masks(ff_array)
+    ff_masks = ff_match_operands(ff_array)
     col = 0
     for veh in st.veh_depart:
         block = get_roles_for_ff(veh, ff_array, st.dic_roles,
@@ -1243,42 +1243,49 @@ def update_dict(dic, k):
 _ROLE_MASK_CACHE = {}
 
 
-def _role_masks(required_skills):
-    """The three broadcast-ready comparisons of a role's constraint vector.
+def _role_operands(required_skills):
+    """A role's constraint vector, prepared for the matmul compatibility test.
 
-    `get_role_from_skills` recomputed `required_skills == -1/1/0` on every call
-    -- 90,342 times per 4,000 interventions -- although the constraint vectors
-    come from `dic_roles_skills`, which is built once in
-    `generate_dic_roles_skills` and never mutated afterwards. There are only 116
-    of them, so the same handful of comparisons was being redone tens of
-    thousands of times.
+    Per constraint matrix (one row per skill level): `plus = (required == 1)`
+    and `minus = (required == -1)` as float32, and `base`, each level's total
+    number of constraints. `get_role_from_skills` counts violations as
+    `base - plus @ F1 - minus @ F0`; see there for why this replaces the
+    boolean broadcast.
 
-    Keyed by array identity, which is safe here precisely because the vectors
+    float32 rather than int: the matmuls then go through BLAS, and every value
+    involved is a small integer (at most 2 x 134), far inside float32's exact
+    range, so the counts are exact and `== 0` is a safe test.
+
+    Cached by array identity, which is safe here precisely because the vectors
     are immutable in practice; the arrays are marked read-only on first use so
-    a future in-place edit fails loudly instead of silently serving stale masks.
-    Held behind a weakref so a discarded role table does not stay alive.
+    a future in-place edit fails loudly instead of silently serving stale
+    operands. Held behind a weakref so a discarded role table does not stay
+    alive. (The cache also fixed a repetition cost: these vectors come from
+    `dic_roles_skills`, built once and never mutated, yet were being
+    re-compared 90,342 times per 4,000 interventions.)
     """
     key = id(required_skills)
     cached = _ROLE_MASK_CACHE.get(key)
     if cached is not None and cached[0]() is required_skills:
         return cached[1]
 
-    masks = ((required_skills == -1)[:, np.newaxis, :],
-             (required_skills == 1)[:, np.newaxis, :],
-             (required_skills == 0)[:, np.newaxis, :])
+    plus = (required_skills == 1).astype(np.float32)
+    minus = (required_skills == -1).astype(np.float32)
+    base = (plus.sum(axis=1) + minus.sum(axis=1))[:, np.newaxis]
+    operands = (plus, minus, base)
 
     try:
         required_skills.flags.writeable = False
     except (AttributeError, ValueError):
-        return masks              # a view we may not lock: correct, just uncached
+        return operands           # a view we may not lock: correct, just uncached
 
     try:
         ref = weakref.ref(required_skills,
                           lambda _, k=key: _ROLE_MASK_CACHE.pop(k, None))
     except TypeError:
-        return masks
-    _ROLE_MASK_CACHE[key] = (ref, masks)
-    return masks
+        return operands
+    _ROLE_MASK_CACHE[key] = (ref, operands)
+    return operands
 
 
 def get_role_from_skills(required_skills, ff_array, ff_masks=None):
@@ -1295,11 +1302,10 @@ def get_role_from_skills(required_skills, ff_array, ff_masks=None):
     mandatory : int
         Number of mandatory roles (used to determine degradation thresholds).
     ff_masks : tuple[numpy.ndarray, numpy.ndarray], optional
-        Precomputed `(ff_array == 0, ff_array == 1)`, already shaped for
-        broadcasting. `ff_array` is fixed for a whole decision while this runs
-        once per role of every vehicle in the departure -- roughly 37 times --
-        so recomputing the pair here redid the same two comparisons over a
-        (n_ff, 134) array 37 times per decision. `gen_state` hoists them; the
+        Precomputed `ff_match_operands(ff_array)`. `ff_array` is fixed for a
+        whole decision while this runs once per role of every vehicle in the
+        departure -- roughly 37 times -- so recomputing the pair here would
+        redo the same work 37 times per decision. `gen_state` hoists them; the
         default keeps direct callers working.
 
     Returns
@@ -1308,19 +1314,36 @@ def get_role_from_skills(required_skills, ff_array, ff_masks=None):
         (role_idx, skill_lvl)
         - role_idx: index of the first compatible role (or a sentinel if none)
         - skill_lvl: compatibility/gradation level for that assignment
+
+    Notes
+    -----
+    A (level, firefighter) pair is compatible when every skill constraint
+    holds: `required == 1` needs `ff == 1`, `required == -1` needs `ff == 0`,
+    `required == 0` accepts anything. This used to be tested literally, by
+    materialising three boolean arrays of shape (levels, n_ff, 134) per call
+    -- ~86k booleans per role, ~37 roles per decision -- which profiling
+    showed to be the simulation's dominant compute cost.
+
+    Counting *violations* says the same thing in two small matmuls:
+
+        V[l, f] = sum_s  plus[l, s] * (1 - F1[f, s])
+                       + minus[l, s] * (1 - F0[f, s])
+                = base[l] - (plus @ F1.T)[l, f] - (minus @ F0.T)[l, f]
+
+    and a pair is compatible iff V == 0. Built from the `== 1` / `== 0` masks
+    of `ff_array`, not its raw values, so an out-of-range entry disqualifies
+    exactly as it did under the boolean test. All quantities are small exact
+    integers in float32, so `== 0` is exact.
     """
 
-    matches_minus_one, matches_one, matches_zero_or_any = _role_masks(required_skills)
+    plus, minus, base = _role_operands(required_skills)
 
     if ff_masks is None:
-        ff_masks = ff_broadcast_masks(ff_array)
-    is_zero, is_one = ff_masks
+        ff_masks = ff_match_operands(ff_array)
+    f_zero_t, f_one_t = ff_masks
 
-    conditions_met = ((matches_minus_one & is_zero) |
-                      (matches_one & is_one) |
-                      matches_zero_or_any)
-
-    conditions_met = np.all(conditions_met, axis=2)
+    violations = base - plus @ f_one_t - minus @ f_zero_t
+    conditions_met = violations == 0
 
     first_valid_index = np.argmax(conditions_met, axis=0) +1
 
@@ -1329,13 +1352,15 @@ def get_role_from_skills(required_skills, ff_array, ff_masks=None):
     return first_valid_index
 
 
-def ff_broadcast_masks(ff_array):
-    """`(ff_array == 0, ff_array == 1)`, shaped to broadcast against role masks.
+def ff_match_operands(ff_array):
+    """`(ff == 0, ff == 1)` transposed to float32, ready for the violation matmul.
 
     Split out so one decision computes them once and every role reuses them.
+    Transposed and made contiguous here, so the 37 matmuls that consume them
+    hit BLAS's fast path instead of each paying for the layout.
     """
-    return ((ff_array == 0)[np.newaxis, :, :],
-            (ff_array == 1)[np.newaxis, :, :])
+    return (np.ascontiguousarray((ff_array == 0).T, dtype=np.float32),
+            np.ascontiguousarray((ff_array == 1).T, dtype=np.float32))
 
 def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills, ff_masks=None):
 
@@ -1368,7 +1393,7 @@ def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills, ff_masks=No
     # required_roles = [role if role in dic_roles_skills else 'EQ_ENG_SAP' for role in required_roles]
 
     if ff_masks is None:
-        ff_masks = ff_broadcast_masks(ff_array)
+        ff_masks = ff_match_operands(ff_array)
 
     return np.column_stack([
         get_role_from_skills(dic_roles_skills[role], ff_array, ff_masks).reshape(-1, 1)
