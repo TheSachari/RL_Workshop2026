@@ -49,6 +49,9 @@ from explainability import (
     get_dic_rare_skills,
     get_related_rows_in_time,
     rare_skills_for_step,
+    irreversible_spent_by,
+    rare_skills_still_covered,
+    rarity_features,
 )
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
@@ -70,6 +73,10 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int, default=159264, help="end after num_inter")
     parser.add_argument("--n_hours", type=int, help="time window to consider")
     parser.add_argument("--top_n", type=int, help="nearest stations to consider")
+    # Scarcity was already computed at every decision and sent only to the
+    # decision log; these expose it to the policy and to the reward.
+    parser.add_argument("--rarity_features", action="store_true", help="feed per-candidate scarcity (locally rare / irreversible / upcoming) to the network")
+    parser.add_argument("--shaping_coeff", type=float, default=0.0, help="weight of potential-based shaping on rare skills still covered (0 disables)")
     parser.add_argument("--reward_weights", type=str, help="JSON file with reward weights")
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
@@ -163,7 +170,8 @@ if __name__ == "__main__":
     # gated on training so its 0.05 floor cannot lift it back off zero.
     rl = {"eps": args.eps_start if args.train else 0.0, "d": 1,
           "compute": False, "old_state": None, "reward": 0.0, "loss": 0,
-          "score": 0.0, "action_num": 0}
+          "score": 0.0, "action_num": 0,
+          "potential": 0.0, "potential_old": None}
     reward_evo = []
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
@@ -171,6 +179,32 @@ if __name__ == "__main__":
     # neighbourhood), so every role of every vehicle there shares one entry.
     scoped_cache = {}
     eps_update = (args.end - args.start) // 23  # ~23 steps to reach 5% of eps
+
+    def irreversible_fn(st, ff_array, ff_existing, action):
+        """Scarce skills taken out of service by this choice, for `dic_indic`."""
+        return irreversible_spent_by(
+            st, ff_array, ff_existing, action,
+            n_following=args.top_n, cache=scoped_cache,
+        )
+
+    def rarity_fn(st, ff_array, ff_existing):
+        """Scarcity for the candidates, and the potential of the state they form.
+
+        Runs before `gen_state`, so the features reach the network on the very
+        decision they describe. Returns None when the features are off, which
+        leaves those state columns zeroed; the potential is still tracked when
+        only shaping is enabled, so the two can be ablated separately.
+        """
+        if args.shaping_coeff:
+            rl["potential"] = rare_skills_still_covered(
+                st, ff_array, ff_existing, n_following=args.top_n, cache=scoped_cache
+            )
+        if not args.rarity_features:
+            return None
+        return rarity_features(
+            st, ff_array, ff_existing, upcoming=upcoming["skills"],
+            n_following=args.top_n, cache=scoped_cache,
+        )
 
     # Applied after `load_environment` so the checkpoint's containers overwrite
     # the freshly built ones, and after `rl` exists so epsilon and its decay
@@ -240,11 +274,21 @@ if __name__ == "__main__":
 
         # `compute` guards the first action, where there is no old_state yet.
         if rl["compute"] and args.train:
-            l0 = agent.step(rl["old_state"], rl["action"], rl["reward"], state, inter_done)
+            # Shaping is applied here, not in `on_action`: the term needs the
+            # potential of the *next* state, and this is the first point where
+            # both are known -- `agent.step` already consumes the previous
+            # transition's reward, so the two line up naturally.
+            reward = rl["reward"]
+            if args.shaping_coeff and rl["potential_old"] is not None:
+                reward += args.shaping_coeff * (
+                    agent.gamma * rl["potential"] - rl["potential_old"]
+                )
+            l0 = agent.step(rl["old_state"], rl["action"], reward, state, inter_done)
             if l0 is not None:
                 rl["loss"] = l0
         else:
             rl["loss"] = 0
+        rl["potential_old"] = rl["potential"]
 
         # Only ask for the Q-values when something will read them: filling the
         # dict copies a value per feasible action on every decision.
@@ -372,7 +416,8 @@ if __name__ == "__main__":
                    on_row=on_row, on_action=on_action,
                    on_interval=log_interval, on_return=on_return,
                    resume_from=resume_from, loop_state=loop_seed,
-                   on_state_ready=on_state_ready)
+                   on_state_ready=on_state_ready, rarity_fn=rarity_fn,
+                   irreversible_fn=irreversible_fn)
 
     dic_indic = env.dic_indic
     print("Simulation done")

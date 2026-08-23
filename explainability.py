@@ -261,8 +261,95 @@ def get_rare_skills_from_planed_ff(date, month, day, hour, planning, df_stations
         cache[key] = result
     return result
 
+def rarity_features(st, ff_array, ff_existing, upcoming=None,
+                    n_following=5, cache=None):
+    """Per-candidate scarcity, shaped `(len(ff_existing), 3)` for `gen_state`.
+
+    The three columns answer "how costly is it to spend this firefighter now":
+
+    0. locally rare skills held -- scarce in the station about to lose them.
+    1. irreversibly rare skills held -- this firefighter is the last cover, so
+       committing them leaves the station unable to fill that role at all.
+    2. skills held that an intervention in the look-ahead window will ask for.
+
+    Counts, not flags: holding three scarce skills is worse to spend than
+    holding one, and the network can always learn to threshold. They are left
+    unnormalised for the same reason the rest of the state is -- values are
+    small integers, and batch-norm sits on the first layer.
+
+    Column 1 is the one the heuristic cannot express: `apply_logic` ranks by
+    skill match alone, so it will happily burn the last holder of a rare skill
+    on a role anybody could have filled.
+    """
+    local, irreversible = rare_skills_for_step(st, n_following=n_following, cache=cache)
+
+    n_ff = len(ff_existing)
+    out = np.zeros((n_ff, 3))
+    if n_ff == 0:
+        return out
+
+    # ff_array rows follow `ff_existing`, so a column slice sums per candidate.
+    for col, skills in enumerate((local, irreversible, upcoming)):
+        if skills is None or len(skills) == 0:
+            continue
+        idx = np.asarray(skills, dtype=int)
+        idx = idx[idx < ff_array.shape[1]]
+        if idx.size:
+            out[:, col] = ff_array[:n_ff][:, idx].sum(axis=1)
+    return out
+
+
+def irreversible_spent_by(st, ff_array, ff_existing, action,
+                          n_following=5, cache=None):
+    """How many scarce skills this choice just took out of service.
+
+    The chosen firefighter's skills intersected with the ones nobody else on
+    duty can cover -- the same rule the decision log records as
+    `irreversible_spent`, but counted on every run so it can enter `dic_indic`
+    and, from there, the reward.
+
+    This is the one quantity that moves with *which* candidate is picked. The
+    three weighted indicators (`rupture_ff`, `v_degraded`,
+    `v1_not_sent_from_s1`) are all properties of the departure: at the instant
+    the agent chooses a firefighter the assignment succeeds by construction, so
+    none of them can distinguish a good choice from a bad one. Measured over
+    200k logged decisions, this fires on 13.3%, and in every one of those an
+    alternative was available.
+    """
+    if action >= 79 or not len(ff_existing) or action >= len(ff_existing):
+        return 0
+    _local, irreversible = rare_skills_for_step(st, n_following=n_following, cache=cache)
+    if len(irreversible) == 0:
+        return 0
+    idx = np.asarray(irreversible, dtype=int)
+    idx = idx[idx < ff_array.shape[1]]
+    if idx.size == 0:
+        return 0
+    return int(ff_array[action, idx].sum())
+
+
+def rare_skills_still_covered(st, ff_array, ff_existing, n_following=5, cache=None):
+    """How many irreversibly-rare skills the on-duty crew can still cover.
+
+    The potential function behind reward shaping. It falls exactly when a
+    decision spends the last holder of a scarce skill, which is the moment the
+    damage is done -- the resulting `rupture_ff` may not surface for hours, by
+    which point the responsible choice is far outside any n-step return.
+    """
+    _local, irreversible = rare_skills_for_step(st, n_following=n_following, cache=cache)
+    if len(irreversible) == 0 or len(ff_existing) == 0:
+        return 0.0
+    idx = np.asarray(irreversible, dtype=int)
+    idx = idx[idx < ff_array.shape[1]]
+    if idx.size == 0:
+        return 0.0
+    # A skill counts as covered while at least one *available* candidate holds
+    # it; `ff_array` rows are the candidates the simulator considers free.
+    return float((ff_array[:len(ff_existing)][:, idx].sum(axis=0) > 0).sum())
+
+
 def main() -> None:
-    
+
     parser = argparse.ArgumentParser(description="Environment params")
     parser.add_argument("--dataset", type=str, help="name of dataset")
     parser.add_argument("--rarity", type=int, help="rarity threshold for skills")

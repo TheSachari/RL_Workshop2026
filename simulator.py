@@ -432,11 +432,32 @@ def _fill_roles(st: _LoopState) -> None:
         st.ff_existing = ff_existing
         ff_array = gen_ff_array(st.df_skills, st.skills_updated, ff_existing)
 
+        # Scarcity features for the candidates, if the caller asked for them.
+        # Computed here rather than in `decide`, which runs after the state is
+        # already built, and left on `st` because `gen_state` takes no extra
+        # arguments. `None` keeps the columns zeroed.
+        st.ff_rarity = (
+            st.rarity_fn(st, ff_array, ff_existing)
+            if getattr(st, "rarity_fn", None) is not None
+            else None
+        )
+
         state = gen_state(st, ff_array, ff_existing, info_avail)
 
         action, skill_lvl, potential_actions = st.decide(
             state, st.all_ff_waiting, ff_array, st.inter_done
         )
+
+        # Did this choice commit the last holder of a scarce skill? Counted for
+        # every run, not just logged ones, so a reward can grade the assignment
+        # itself -- the other indicators move with the departure, not with which
+        # candidate was picked. Same rule as the decision log's
+        # `irreversible_spent`: the chosen firefighter's skills intersected with
+        # the ones nobody else on duty can cover.
+        if st.irreversible_fn is not None and action < 79:
+            st.dic_indic['irreversible_spent'] += st.irreversible_fn(
+                st, ff_array, ff_existing, action
+            )
 
         all_roles_found, st.vehicle_found = step(
             st, action, ff_existing, num_role, all_roles_found, skill_lvl,
@@ -628,6 +649,8 @@ def run_simulation(
     resume_from=None,
     loop_state=None,
     on_state_ready=None,
+    rarity_fn=None,
+    irreversible_fn=None,
 ):
     """Run the event stream, delegating each action choice to `decide`.
 
@@ -671,6 +694,8 @@ def run_simulation(
         decide=decide,
         on_action=on_action,
     )
+    st.rarity_fn = rarity_fn
+    st.irreversible_fn = irreversible_fn
 
     # Seed the cross-event fields from a checkpoint before the loop starts, so
     # the first resumed event sees the same bookkeeping the interrupted run had.

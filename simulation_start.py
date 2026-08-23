@@ -12,7 +12,12 @@ from collective_functions import (
     load_environment,
 )
 from decision_log import DecisionLog
-from explainability import get_dic_rare_skills, get_related_rows_in_time, rare_skills_for_step
+from explainability import (
+    get_dic_rare_skills,
+    get_related_rows_in_time,
+    irreversible_spent_by,
+    rare_skills_for_step,
+)
 from paths import PLOTS, resolve
 from sim_state import Fleet
 from simulator import run_simulation
@@ -120,8 +125,16 @@ if __name__ == "__main__":
         print(f"{num_inter} v_out: {vehicle_out} | v1notfroms1: {env.dic_indic['v1_not_sent_from_s1']} | v3notfroms3: {env.dic_indic['v3_not_sent_from_s3']} | v_not_found_ls: {env.dic_indic['v_not_found_in_last_station']} | deg: {env.dic_indic['v_degraded']} | rupture_ff: {env.dic_indic['rupture_ff']}", flush=True)
         print(f"{num_inter} z1_VSAV_sent: {env.dic_indic['z1_VSAV_sent']} | z1_FPT_sent: {env.dic_indic['z1_FPT_sent']} | z1_EPA_sent: {env.dic_indic['z1_EPA_sent']} | VSAV_disp: {fleet.VSAV.disp} | FPT_disp: {fleet.FPT.disp} | EPA_disp: {fleet.EPA.disp} |", flush=True)
 
+    def irreversible_fn(st, ff_array, ff_existing, action):
+        """Same scarce-skill counter the agent reports, so the two compare."""
+        return irreversible_spent_by(
+            st, ff_array, ff_existing, action,
+            n_following=args.top_n, cache=scoped_cache,
+        )
+
     run_simulation(
         env, fleet, decide, action_size=action_size, on_interval=log_interval,
+        irreversible_fn=irreversible_fn,
         on_row=on_row if decision_log is not None else None,
         on_state_ready=on_state_ready,
     )

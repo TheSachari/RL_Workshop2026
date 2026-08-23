@@ -241,7 +241,11 @@ class Dueling_QNetwork(nn.Module):
         # AM
         self.n_heads = 4
         self.d_model = 64
-        self.d_input = 40 # roles + disp
+        # Derived, not fixed at 40: the per-entity width is whatever
+        # `gen_state` produces (roles + rarity + availability), and it grew
+        # when scarcity features were added. state_size // (action_size + 2)
+        # is exact -- the state is (action_size + 2) rows of equal width.
+        self.d_input = state_size // (action_size + 2)
         self.attention = Attention(self.d_input, self.d_model, self.n_heads)
 
         # infos NN
@@ -396,7 +400,8 @@ class QVN(nn.Module):
             # AM
             self.n_heads = 4
             self.d_model = 64
-            self.d_input = 40 # roles + disp
+            # Derived, not fixed at 40 -- see the note in the other AM block.
+            self.d_input = state_size // (action_size + 2)
             self.attention = Attention(self.d_input, self.d_model, self.n_heads)
             self.num_entities = self.action_size + 2
     
@@ -1031,7 +1036,8 @@ class PPO_ActorCriticAM(nn.Module):
         # Attention module
         self.n_heads = 4
         self.d_model = 64
-        self.d_input = 40  # roles + disp = Features
+        # Derived, not fixed at 40 -- see the note in QVN's AM block.
+        self.d_input = state_size // (action_size + 2)
         self.attention = Attention(self.d_input, self.d_model, self.n_heads)
 
         # infos NN
