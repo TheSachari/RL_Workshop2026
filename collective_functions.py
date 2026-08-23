@@ -689,73 +689,91 @@ def gen_state(st, ff_array, ff_existing, info_avail):
     being filled.
     """
 
-    nb_roles = N_ROLE_COLS
+    # One buffer for the whole state, filled block by block, rather than eight
+    # `vstack`/`hstack`/`concatenate` calls each allocating and copying the
+    # whole thing again. The layout is fixed -- (action_size + 2) rows of
+    # `state_width()` -- so it can be zeroed once and written into, which also
+    # makes the two filler blocks disappear: padding is whatever was never
+    # written.
+    #
+    # Row 0 is rl_infos, row 1 the current-role one-hot, rows 2.. the
+    # candidates. Column order inside a candidate row is roles | rarity |
+    # availability, and `get_potential_actions` depends on availability being
+    # the last `N_AVAILABILITY_COLS`.
+    width = state_width()
+    state = np.zeros((st.action_size + N_HEADER_ROWS, width))
 
-    # ff skills
-    state = np.hstack(([get_roles_for_ff(veh, ff_array, st.dic_roles, st.dic_roles_skills) for veh in st.veh_depart])).astype(float)
+    role_end = N_ROLE_COLS
+    rarity_end = role_end + N_RARITY_COLS
 
-    state /= 8 # normalization, 8 skill lvls
+    n_ff = len(ff_existing)
+    body = state[N_HEADER_ROWS:]
 
+    # --- roles ---------------------------------------------------------
+    # `ff_array` is fixed for the decision, so its two comparisons are hoisted
+    # here and shared by every role of every vehicle instead of being rebuilt
+    # inside each `get_role_from_skills` call.
+    ff_masks = ff_broadcast_masks(ff_array)
+    col = 0
+    for veh in st.veh_depart:
+        block = get_roles_for_ff(veh, ff_array, st.dic_roles,
+                                 st.dic_roles_skills, ff_masks)
+        rows, cols = block.shape
+        if col + cols > role_end:
+            # The old code sized this block from the data and padded to
+            # `N_ROLE_COLS`; writing into a fixed buffer would instead drop the
+            # overflow silently, feeding the policy a departure whose last
+            # vehicle has no roles. The widest vehicle in the table needs 6
+            # columns and a train is capped at 5, so 37 leaves real headroom --
+            # but the margin is small enough that a wider vehicle type should
+            # say so rather than be truncated.
+            raise ValueError(
+                f"departure needs {col + cols} role columns but N_ROLE_COLS is "
+                f"{role_end}: {st.veh_depart}"
+            )
+        # Written straight into the buffer, normalised in place: `state /= 8`
+        # used to walk the full padded matrix, most of which is zeros.
+        body[:rows, col:col + cols] = block
+        col += cols
+    body[:, :role_end] /= 8  # normalization, 8 skill lvls
 
-    # filler row
-    filler = np.zeros((st.action_size-state.shape[0], state.shape[1])) # max 74 de base + 6 ff lent
-    state = np.vstack((state, filler))
-
-    # filler col
-    filler = np.zeros((state.shape[0], nb_roles - state.shape[1]))
-    state = np.concatenate((state, filler), axis=1)
-
-    # Scarcity of each candidate, inserted *before* the availability block:
-    # `get_potential_actions` reads `state[2:, -3:]` to find which firefighters
-    # are free, so availability has to remain the last three columns.
+    # --- scarcity ------------------------------------------------------
+    # Kept *before* the availability block: `get_potential_actions` reads the
+    # last `N_AVAILABILITY_COLS` to find which firefighters are free.
     #
     # Without these the policy sees which roles a candidate can fill but not
     # whether anyone else could fill them, so it cannot tell a rare profile from
     # an interchangeable one and spends the rare ones first. The quantities were
     # already computed at every decision -- they were routed to the decision log
-    # instead of to the network. Zeros when the caller supplies nothing, which
-    # keeps the width fixed whether or not rarity is being fed.
+    # instead of to the network. Left zeroed when the caller supplies nothing,
+    # which keeps the width fixed whether or not rarity is being fed.
     rarity = getattr(st, "ff_rarity", None)
-    n_ff = len(ff_existing)
-    if rarity is None:
-        rarity_block = np.zeros((st.action_size, N_RARITY_COLS))
-    else:
-        rarity_block = np.vstack((
-            np.asarray(rarity, dtype=float)[:n_ff],
-            np.zeros((st.action_size - n_ff, N_RARITY_COLS)),
-        ))
-    state = np.hstack((state, rarity_block))
+    if rarity is not None and n_ff:
+        body[:n_ff, role_end:rarity_end] = np.asarray(rarity, dtype=float)[:n_ff]
 
-    # resp time
+    # --- availability --------------------------------------------------
     # `ff_existing` directly, not `df_skills.loc[ff_existing, :].index`: that
     # reindexed a 268-column frame to read back the very labels it was given,
     # at 168 us against 0.15 us, on every decision. The two are the same list --
     # `.loc` with a label list preserves order and repeats duplicates.
-    resp_time = np.array([st.dic_ff[f] for f in ff_existing])
-    resp_time_norm = np.where(resp_time < 0, 0.0, resp_time/st.max_duration) # normalization
-    mask_minus1 = (resp_time == -1)
-    mask_minus2 = (resp_time == -2)
-    resp_time_all = np.stack([resp_time_norm, mask_minus1, mask_minus2], axis=1)
+    if n_ff:
+        resp_time = np.fromiter((st.dic_ff[f] for f in ff_existing),
+                                dtype=float, count=n_ff)
+        avail = body[:n_ff, rarity_end:]
+        np.divide(resp_time, st.max_duration, out=avail[:, 0])
+        avail[resp_time < 0, 0] = 0.0
+        avail[:, 1] = (resp_time == -1)
+        avail[:, 2] = (resp_time == -2)
 
-    zero_rows = np.zeros(((st.action_size-len(ff_existing)), resp_time_all.shape[1]))
-    availability = np.vstack((resp_time_all, zero_rows))
+    # --- header rows ---------------------------------------------------
+    state[1, st.idx_role] = 1  # current role to fill
 
-    state = np.hstack((state, availability))
-
-    # current role to fill
-    current_role = [0]*state.shape[1]
-    current_role[st.idx_role] = 1
-    state = np.vstack((current_role, state))
-
-    # rl_infos + position + time
-
-    # Padded to the state's width rather than to a literal 22: the row has to
-    # match whatever the per-candidate block now is, and that grew by the three
-    # rarity columns.
+    # rl_infos + position + time. Sliced rather than padded to a literal 22:
+    # the row has to match whatever the per-candidate block now is, and that
+    # grew by the three rarity columns.
     rl_infos = (info_avail + [st.coord_x, st.coord_y, st.month_sin, st.month_cos,
                               st.day_sin, st.day_cos, st.hour_sin, st.hour_cos])
-    rl_infos = np.array(rl_infos + [0] * (state.shape[1] - len(rl_infos)))
-    state = np.vstack((rl_infos, state))
+    state[0, :len(rl_infos)] = rl_infos
 
     return state
 
@@ -1209,7 +1227,7 @@ def _role_masks(required_skills):
     return masks
 
 
-def get_role_from_skills(required_skills, ff_array):
+def get_role_from_skills(required_skills, ff_array, ff_masks=None):
 
     """
     Find the first role index compatible with a given firefighter's skills for a vehicle.
@@ -1222,6 +1240,13 @@ def get_role_from_skills(required_skills, ff_array):
         List of required-skill vectors for each role of the vehicle.
     mandatory : int
         Number of mandatory roles (used to determine degradation thresholds).
+    ff_masks : tuple[numpy.ndarray, numpy.ndarray], optional
+        Precomputed `(ff_array == 0, ff_array == 1)`, already shaped for
+        broadcasting. `ff_array` is fixed for a whole decision while this runs
+        once per role of every vehicle in the departure -- roughly 37 times --
+        so recomputing the pair here redid the same two comparisons over a
+        (n_ff, 134) array 37 times per decision. `gen_state` hoists them; the
+        default keeps direct callers working.
 
     Returns
     -------
@@ -1233,8 +1258,12 @@ def get_role_from_skills(required_skills, ff_array):
 
     matches_minus_one, matches_one, matches_zero_or_any = _role_masks(required_skills)
 
-    conditions_met = ((matches_minus_one & (ff_array == 0)[np.newaxis, :, :]) |
-                      (matches_one & (ff_array == 1)[np.newaxis, :, :]) |
+    if ff_masks is None:
+        ff_masks = ff_broadcast_masks(ff_array)
+    is_zero, is_one = ff_masks
+
+    conditions_met = ((matches_minus_one & is_zero) |
+                      (matches_one & is_one) |
                       matches_zero_or_any)
 
     conditions_met = np.all(conditions_met, axis=2)
@@ -1245,7 +1274,16 @@ def get_role_from_skills(required_skills, ff_array):
 
     return first_valid_index
 
-def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills):
+
+def ff_broadcast_masks(ff_array):
+    """`(ff_array == 0, ff_array == 1)`, shaped to broadcast against role masks.
+
+    Split out so one decision computes them once and every role reuses them.
+    """
+    return ((ff_array == 0)[np.newaxis, :, :],
+            (ff_array == 1)[np.newaxis, :, :])
+
+def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills, ff_masks=None):
 
     """
     Compute compatible roles (and skill levels) for each firefighter for each vehicle in the departure list.
@@ -1275,7 +1313,13 @@ def get_roles_for_ff(vehicle, ff_array, dic_roles, dic_roles_skills):
     
     # required_roles = [role if role in dic_roles_skills else 'EQ_ENG_SAP' for role in required_roles]
 
-    return np.column_stack([get_role_from_skills(dic_roles_skills[role], ff_array).reshape(-1, 1) for role in required_roles])
+    if ff_masks is None:
+        ff_masks = ff_broadcast_masks(ff_array)
+
+    return np.column_stack([
+        get_role_from_skills(dic_roles_skills[role], ff_array, ff_masks).reshape(-1, 1)
+        for role in required_roles
+    ])
 
 def distance_euclidienne(x1, y1, x2, y2):
     """
