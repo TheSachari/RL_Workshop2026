@@ -63,6 +63,7 @@ from explainability import (
 from paths import DATA, PLOTS, REWARD_WEIGHTS, SVG_MODEL, resolve
 from sim_state import Fleet
 from simulator import run_simulation
+from transition import PendingTransition
 
 # Shared empty result, for decisions where scoped rarity is not computed.
 _EMPTY = np.array([], dtype=int)
@@ -190,9 +191,12 @@ if __name__ == "__main__":
     # Eval starts at 0 and must stay there: see `on_return`, where the decay is
     # gated on training so its 0.05 floor cannot lift it back off zero.
     rl = {"eps": args.eps_start if args.train else 0.0, "d": 1,
-          "compute": False, "old_state": None, "reward": 0.0, "loss": 0,
-          "score": 0.0, "action_num": 0,
-          "potential": 0.0, "potential_old": None}
+          "loss": 0, "score": 0.0, "action_num": 0, "potential": None}
+
+    # The one-step lag between choosing an action and being able to learn from
+    # it, owned by one object instead of five keys in `rl`. See transition.py.
+    pending = PendingTransition(gamma=agent.gamma,
+                                shaping_coeff=args.shaping_coeff)
     reward_evo = []
     dic_saved_skills = {k: 0 for k in range(0, 134)}
     upcoming = {"skills": np.array([], dtype=int)}
@@ -293,23 +297,18 @@ if __name__ == "__main__":
                 live["st"], n_following=args.top_n, cache=scoped_cache
             )
 
-        # `compute` guards the first action, where there is no old_state yet.
-        if rl["compute"] and args.train:
-            # Shaping is applied here, not in `on_action`: the term needs the
-            # potential of the *next* state, and this is the first point where
-            # both are known -- `agent.step` already consumes the previous
-            # transition's reward, so the two line up naturally.
-            reward = rl["reward"]
-            if args.shaping_coeff and rl["potential_old"] is not None:
-                reward += args.shaping_coeff * (
-                    agent.gamma * rl["potential"] - rl["potential_old"]
-                )
-            l0 = agent.step(rl["old_state"], rl["action"], reward, state, inter_done)
+        # Complete the previous decision's transition against this state, which
+        # is its `next_state`. Returns None on the first decision of a run --
+        # what the old `compute` flag guarded -- and the shaping term is applied
+        # inside, where both potentials are in scope.
+        transition = pending.close(state, inter_done, potential=rl["potential"])
+        rl["loss"] = 0
+        if transition is not None and args.train:
+            l0 = agent.step(transition.state, transition.action,
+                            transition.reward, transition.next_state,
+                            transition.done)
             if l0 is not None:
                 rl["loss"] = l0
-        else:
-            rl["loss"] = 0
-        rl["potential_old"] = rl["potential"]
 
         # Only ask for the Q-values when something will read them: filling the
         # dict copies a value per feasible action on every decision.
@@ -341,17 +340,18 @@ if __name__ == "__main__":
                 irreversible_rare_skills=scoped["irreversible"],
             )
 
-        rl["action"] = action
-        rl["old_state"] = state
+        # Opened with the potential of the state just acted on, so `close` can
+        # difference it against the next one.
+        pending.open(state, action, potential=rl["potential"])
         return action, skill_lvl, potential_actions
 
     def on_action(ctx):
         """Reward is the indicator delta, read before dic_indic_old is refreshed."""
-        rl["reward"] = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d, dic_tarif)
-        rl["score"] += rl["reward"]
+        reward = compute_reward(ctx.dic_indic, ctx.dic_indic_old, ctx.num_d, dic_tarif)
+        pending.add_reward(reward)
+        rl["score"] += reward
         rl["action_num"] += 1
-        reward_evo.append([rl["action_num"], rl["reward"]])
-        rl["compute"] = True
+        reward_evo.append([rl["action_num"], reward])
 
     def log_interval(num_inter, vehicle_out, fleet):
         rwd_mean = np.mean([r[1] for r in reward_evo[-100:]]) if reward_evo else float("nan")
