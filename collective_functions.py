@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from paths import DATA_ENVIRONMENT, resolve
+from planning_state import PlanningView, SlotStore
 from sim_state import Environment, Fleet, ReinforcementState, RunLog  # noqa: F401
 
 # Seed for the environment's downsampling draws. Exposed so callers can vary it
@@ -635,6 +636,15 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
     old_date = df_pc.iloc[0, 1]
     date_reference = df_pc.iloc[0, 1]
     skills_updated = update_skills(df_skills, date_reference)
+
+    # Converted last: `constrain_ff` reads the nested dict to learn which
+    # station each firefighter serves, and nothing filters `planning` itself,
+    # so this is the first point where its contents are final. `PlanningView`
+    # keeps the four-level indexing the call sites use; the saving is that a
+    # copy shares every slot until it is written, instead of deep-copying
+    # 334,056 slot dicts (2.6 s) -- which is what makes parallel environments
+    # possible.
+    planning = PlanningView(SlotStore.from_planning(planning))
 
     return dic_vehicles, dic_functions, df_skills, dic_roles_skills, dic_roles, planning, \
     dic_inter, dic_ff, dic_indic, dic_indic_old, Z_1, Z_4, dic_lent, dic_station_distance, df_pc, \
