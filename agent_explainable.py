@@ -359,21 +359,29 @@ class DQNAgent:
             self.icm = ICM(inverse_m, forward_m).to(device)
             print(inverse_m, forward_m)
 
-    def step(
+    def observe(
         self,
         state: np.ndarray,
         action: int,
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> Optional[float]:
-        """Store transition and trigger a learning step periodically."""
+    ) -> None:
+        """Store one transition. No gradient work happens here."""
         state_t = torch.from_numpy(state).float()
         next_state_t = torch.from_numpy(next_state).float()
 
         self.memory.add(state_t, action, reward, next_state_t, done)
         self.t_step += 1
 
+    def train_step(self) -> Optional[float]:
+        """Learn from a batch if one is due, else None.
+
+        Split from `observe` so the two can run at different rates or in
+        different threads: an actor stepping the environment only needs to
+        store, and whoever owns the network decides when to consume the
+        buffer. `step` keeps the combined behaviour for the single-actor path.
+        """
         if self.t_step % self.update_every != 0:
             return None
 
@@ -389,6 +397,18 @@ class DQNAgent:
 
         self.q_updates += 1
         return loss_value
+
+    def step(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> Optional[float]:
+        """Store transition and trigger a learning step periodically."""
+        self.observe(state, action, reward, next_state, done)
+        return self.train_step()
 
     def act(
         self,
@@ -709,15 +729,15 @@ class FQFAgent:
             self.icm = ICM(inverse_m, forward_m).to(device)
             print(inverse_m, forward_m)
 
-    def step(
+    def observe(
         self,
         state: np.ndarray,
         action: int,
         reward: float,
         next_state: np.ndarray,
         done: bool,
-    ) -> Optional[float]:
-        """Store transition and trigger a learning step periodically."""
+    ) -> None:
+        """Store one transition. No gradient work happens here."""
         self.memory.add(
             torch.from_numpy(state).float(),
             action,
@@ -727,6 +747,14 @@ class FQFAgent:
         )
         self.t_step += 1
 
+    def train_step(self) -> Optional[float]:
+        """Learn from a batch if one is due, else None.
+
+        Split from `observe` so the two can run at different rates or in
+        different threads: an actor stepping the environment only needs to
+        store, and whoever owns the network decides when to consume the
+        buffer. `step` keeps the combined behaviour for the single-actor path.
+        """
         if self.t_step % self.update_every != 0:
             return None
 
@@ -742,6 +770,18 @@ class FQFAgent:
 
         self.q_updates += 1
         return loss_value
+
+    def step(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> Optional[float]:
+        """Store transition and trigger a learning step periodically."""
+        self.observe(state, action, reward, next_state, done)
+        return self.train_step()
 
     def act(
         self,
