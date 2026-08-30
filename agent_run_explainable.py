@@ -91,7 +91,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_metrics_as", type=str, default="dic_indic_agent", help="save metrics as")
     parser.add_argument("--constraint_factor_veh", type=int, default=1, help="size of available vehicles in Z1. factor 1 is 100%%, factor 3 is 33%%")
     parser.add_argument("--constraint_factor_ff", type=float, default=1, help="size of available firefighters. factor 1 is 100%%, factor 3 is 33%%")
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the environment downsampling draws")
+    parser.add_argument("--seed", type=int, default=None, help="seed for the environment downsampling draws and the agent's own initialisation; defaults to the config's \"seed\"")
     parser.add_argument("--resume", action='store_true', help="Resume from the checkpoint written by --checkpoint_name")
     parser.add_argument("--checkpoint_name", type=str, default=None, help="Resumable checkpoint file (default: <model_name>.ckpt)")
     parser.add_argument("--checkpoint_every", type=int, default=10000, help="Write a resumable checkpoint every N interventions")
@@ -107,12 +107,23 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    with open(resolve(args.hyper_params, DATA), "r") as f:
+        hyper_params = json.load(f)
+
+    # One seed drives everything. The agent seeds itself from
+    # `hyper_params["seed"]` in its constructor, which runs *after* this block,
+    # so seeding only the globals here would leave weight initialisation --
+    # and with it the whole training run -- pinned to whatever the config says.
+    # `--seed` therefore overrides the config, and omitting it keeps the
+    # config's value, so existing commands reproduce exactly as before.
+    if args.seed is None:
+        args.seed = hyper_params.get("seed", DEFAULT_SEED)
+    else:
+        hyper_params["seed"] = args.seed
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    with open(resolve(args.hyper_params, DATA), "r") as f:
-        hyper_params = json.load(f)
 
     # A `state_size` that disagrees with what `gen_state` builds does not fail
     # here -- it fails several minutes in, at the first forward pass, as a
