@@ -4,9 +4,15 @@ demande).
 
 Usage :
   python tools/waste_baseline.py --dataset <flux>_rs.pkl --end N [--is_best] --tag NOM
+
+`--seed` ne concerne que la baseline `random` : `apply_logic` y tire via le
+module `random`, seul point d'entropie du chemin baseline. `best` prend le
+minimum de niveau de compétence et ne lit jamais le générateur, donc son
+resultat est identique quelle que soit la graine.
 """
 import argparse
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,9 +103,18 @@ def main():
     ap.add_argument("--end", type=int, default=53088)
     ap.add_argument("--is_best", action="store_true")
     ap.add_argument("--tag", default="run")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="graine du tirage de `random` (sans effet si --is_best)")
     args = ap.parse_args()
 
+    # La graine d'environnement reste 42 : le flux d'évaluation doit être
+    # identique pour toutes les politiques. Seul le tirage de décision varie.
     env = load_environment(1, 1, args.dataset, 1, args.end, 42)
+
+    # Après `load_environment` : `constrain_veh` y appelle `random.seed(42)`,
+    # qui écraserait une graine posée plus tôt.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
     def decide(state, all_ff_waiting, ff_array, inter_done):
         tally["decisions"] += 1
@@ -117,9 +132,15 @@ def main():
                        irreversible_fn=irreversible_split)
 
     t = tally
-    print(f"\n=== {args.tag} | {args.dataset} | is_best={args.is_best} ===")
-    print(f"v_required                       : {env.dic_indic['v_required']}")
-    print(f"rupture_ff                       : {env.dic_indic['rupture_ff']}")
+    print(f"\n=== {args.tag} | {args.dataset} | is_best={args.is_best}"
+          f" | seed={args.seed} ===")
+    # Tous les indicateurs d'observation, pour que le tableau récapitulatif
+    # sorte d'un seul passage plutôt que d'un run par ligne.
+    for k in ("v_required", "v_sent", "v_sent_full", "v_degraded",
+              "function_not_found", "v1_not_sent_from_s1",
+              "v3_not_sent_from_s3", "v_not_found_in_last_station",
+              "skill_lvl", "ff_sent", "rupture_ff"):
+        print(f"{k:33s}: {env.dic_indic.get(k)}")
     print(f"décisions                        : {t['decisions']}")
     print(f"  dont dépense irrécupérable     : {t['decisions_avec_irrev']}"
           f"  ({100*t['decisions_avec_irrev']/max(t['decisions'],1):.1f} %)")
