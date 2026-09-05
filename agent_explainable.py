@@ -1353,7 +1353,13 @@ class DTAgent:
 # PPO
 # -----------------------------
 class PPOAgent:
-    """PPO-style actor-critic with action masking and optional curiosity."""
+    """PPO actor-critic with action masking and optional curiosity.
+
+    Implements the clipped surrogate objective of Schulman et al. (2017):
+    GAE(lambda) advantages bootstrapped at the rollout boundary, `n_epochs`
+    minibatch passes over each rollout, and a ratio clipped to
+    `1 +/- clip_range` with an approximate-KL early stop.
+    """
 
     def __init__(
         self,
@@ -1387,16 +1393,41 @@ class PPOAgent:
         decay_update: int,
         device: torch.device,
         seed: int,
+        clip_range: float = 0.2,
+        n_epochs: int = 10,
+        minibatch_size: int = 64,
+        gae_lambda: float = 0.95,
+        value_coeff: float = 0.5,
+        target_kl: Optional[float] = 0.03,
     ) -> None:
         self.am = am
 
-        # PPO-specific LR (kept from your original)
-        self.actor_lr = 3e-4
-        self.critic_lr = 1e-3
+        # Actor/critic LRs derive from the configured `lr` so the hyper-parameter
+        # file is actually honoured: the decay schedules below already write
+        # `self.lr` into both optimizers, so hard-coding the initial values made
+        # the first `decay_update` steps run at a rate nothing had asked for.
+        self.actor_lr = lr
+        self.critic_lr = lr
 
-        # Rollout storage: (state, action, reward, next_state, done, invalid_actions)
+        # PPO surrogate objective.
+        self.clip_range = clip_range
+        self.n_epochs = n_epochs
+        self.minibatch_size = minibatch_size
+        self.gae_lambda = gae_lambda
+        self.value_coeff = value_coeff
+        # Early-stops the epoch loop once the updated policy has drifted this
+        # far from the behaviour policy. None disables the check.
+        self.target_kl = target_kl
+
+        # Rollout storage: one entry per decision, holding the behaviour
+        # policy's log-prob and value alongside the transition. PPO's ratio is
+        # meaningless without the log-prob recorded *at acting time*: recomputing
+        # it after the update would give a ratio of exactly 1 on the first epoch
+        # and silently disable clipping.
         self.rollout_storage = []
         self.last_invalid_actions: Optional[List[int]] = None
+        self.last_log_prob: Optional[float] = None
+        self.last_value: Optional[float] = None
 
         self.state_size = state_size
         self.action_size = action_size
@@ -1462,6 +1493,13 @@ class PPOAgent:
                 use_batchnorm=use_batchnorm,
             ).to(device)
 
+        # The runner, `checkpoint.save` and the model-saving path all reach for
+        # `qnetwork_local`, which is the name the value-based agents give their
+        # trained module. Binding the same object under that name -- not a copy --
+        # lets `--train`/eval mode, weight loading and checkpointing work on PPO
+        # without special-casing the agent everywhere.
+        self.qnetwork_local = self.model
+
         # Curiosity module
         self.icm: Optional[ICM] = None
         if self.curiosity != 0:
@@ -1474,33 +1512,66 @@ class PPOAgent:
             )
             self.icm = ICM(inverse_m, forward_m).to(device)
 
-        actor_parameters = (
-            list(self.model.actor_body.parameters()) + list(self.model.policy_head.parameters())
+        # The bodies and heads are disjoint, but the attention block and the two
+        # row encoders that feed them are shared. Listing only the bodies and
+        # heads left those 25k parameters -- the attention that compares the 80
+        # candidates against each other, which is the heart of the assignment
+        # problem -- in no optimiser at all: they stayed at their random
+        # initialisation for the whole run, and actor and critic had to learn on
+        # top of a fixed arbitrary encoding of the state.
+        #
+        # They are attached to the actor, so the encoder is shaped by the policy
+        # objective, and are deliberately *not* given to the critic as well:
+        # a parameter in both optimisers would take two Adam steps per minibatch
+        # off inconsistent moment estimates.
+        shared_parameters = [
+            p
+            for name, p in self.model.named_parameters()
+            if not name.startswith(
+                ("actor_body", "critic_body", "policy_head", "value_head")
+            )
+        ]
+
+        self.actor_parameters = (
+            list(self.model.actor_body.parameters())
+            + list(self.model.policy_head.parameters())
+            + shared_parameters
         )
-        critic_parameters = (
+        self.critic_parameters = (
             list(self.model.critic_body.parameters()) + list(self.model.value_head.parameters())
         )
 
-        self.actor_optimizer = optim.Adam(actor_parameters, lr=self.actor_lr)
-        self.critic_optimizer = optim.Adam(critic_parameters, lr=self.critic_lr)
+        self.actor_optimizer = optim.Adam(self.actor_parameters, lr=self.actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic_parameters, lr=self.critic_lr)
 
     def act(
-        self, state: np.ndarray, all_ff_waiting, eps: float = 0.0
+        self,
+        state: np.ndarray,
+        all_ff_waiting,
+        eps: float = 0.0,
+        explain: Optional[dict] = None,
     ) -> Tuple[int, int, List[int]]:
         """Sample an action from the masked categorical distribution.
 
         Returns the feasible actions alongside the choice: callers use them for
         explainability (which alternatives were available and rejected).
+
+        The sampled action's log-prob and the critic's value are stashed for the
+        next `step`, because PPO's importance ratio is defined against the policy
+        that actually collected the data.
+
+        `explain`, when given, is filled in place with the per-action policy
+        probabilities and the state value, mirroring the FQF agent so the
+        decision log works for either.
         """
         potential_actions, potential_skills = get_potential_actions(state, all_ff_waiting)
         state_t = torch.from_numpy(state).float().to(self.device)
 
-        self.model.eval()
-        with torch.inference_mode():
-            logits, _value = self.model(state_t)
-        self.model.train()
+        with torch.inference_mode(), inference_pass(self.model):
+            logits, value = self.model(state_t)
 
         logits = logits.squeeze(0)
+        value = value.reshape(-1)[0]
         invalid_actions = [a for a in range(self.action_size) if a not in potential_actions]
 
         masked_logits = logits.clone()
@@ -1508,9 +1579,20 @@ class PPOAgent:
             masked_logits[invalid_actions] = -1e9
 
         dist = torch.distributions.Categorical(logits=masked_logits)
-        action = int(dist.sample().item())
+        action_t = dist.sample()
+        action = int(action_t.item())
 
+        # `.clone()` because inference-mode tensors cannot be recorded and later
+        # used in an autograd graph; these are stored, not differentiated.
+        self.last_log_prob = float(dist.log_prob(action_t).item())
+        self.last_value = float(value.item())
         self.last_invalid_actions = invalid_actions
+
+        if explain is not None:
+            probs = dist.probs
+            explain["values"] = {a: float(probs[a].item()) for a in potential_actions}
+            explain["state_value"] = self.last_value
+
         skill_lvl = potential_skills[potential_actions.index(action)]
         return action, skill_lvl, potential_actions
 
@@ -1522,13 +1604,33 @@ class PPOAgent:
         next_state: np.ndarray,
         done: bool,
     ) -> Optional[Tuple[Tensor, Tensor]]:
-        """Store rollout and trigger PPO update once we have a batch."""
+        """Store the rollout entry and trigger a PPO update once the batch is full."""
         state_t = torch.from_numpy(state).float()
         next_state_t = torch.from_numpy(next_state).float()
 
         invalid_actions = self.last_invalid_actions or []
-        self.rollout_storage.append((state_t, action, reward, next_state_t, done, invalid_actions))
+        # A `step` without a preceding `act` (a resumed run, a scripted action)
+        # has no behaviour log-prob. Recording 0.0 would claim probability 1 and
+        # skew the ratio, so the entry is skipped instead.
+        if self.last_log_prob is None:
+            self.last_invalid_actions = None
+            return None
+
+        self.rollout_storage.append(
+            (
+                state_t,
+                action,
+                reward,
+                next_state_t,
+                done,
+                invalid_actions,
+                self.last_log_prob,
+                self.last_value,
+            )
+        )
         self.last_invalid_actions = None
+        self.last_log_prob = None
+        self.last_value = None
 
         self.t_step += 1
         if self.t_step % self.batch_size == 0:
@@ -1536,17 +1638,48 @@ class PPOAgent:
 
         return None
 
+    def _bootstrap_value(self, next_state: Tensor, done: bool) -> float:
+        """Value of the state the rollout was cut at.
+
+        The rollout boundary is arbitrary -- it falls every `batch_size`
+        decisions, not at an episode end -- so truncating the return there
+        would treat an unfinished intervention as if it earned nothing more.
+        A terminal state is worth 0 by definition and is not bootstrapped.
+        """
+        if done:
+            return 0.0
+        with torch.inference_mode(), inference_pass(self.model):
+            _logits, value = self.model(next_state.unsqueeze(0).to(self.device))
+        return float(value.reshape(-1)[0].item())
+
     def learn(self) -> Optional[Tuple[Tensor, Tensor]]:
-        """Update actor and critic on the stored rollout (simple PPO-style update)."""
+        """Clipped-surrogate PPO update over the stored rollout.
+
+        Differs from a plain policy gradient in the three ways that define PPO:
+        advantages come from GAE(lambda) rather than raw Monte-Carlo returns,
+        the rollout is reused for `n_epochs` passes in minibatches instead of a
+        single pass, and the objective is clipped so those extra passes cannot
+        walk the policy arbitrarily far from the data that justified the update.
+        """
         if not self.rollout_storage:
             return None
 
         states = torch.stack([m[0] for m in self.rollout_storage]).to(self.device)
-        actions = torch.tensor([m[1] for m in self.rollout_storage], dtype=torch.long, device=self.device)
-        rewards = torch.tensor([m[2] for m in self.rollout_storage], dtype=torch.float32, device=self.device)
+        actions = torch.tensor(
+            [m[1] for m in self.rollout_storage], dtype=torch.long, device=self.device
+        )
+        rewards = torch.tensor(
+            [m[2] for m in self.rollout_storage], dtype=torch.float32, device=self.device
+        )
         next_states = torch.stack([m[3] for m in self.rollout_storage]).to(self.device)
         dones = [m[4] for m in self.rollout_storage]
         invalid_actions = [m[5] for m in self.rollout_storage]
+        old_log_probs = torch.tensor(
+            [m[6] for m in self.rollout_storage], dtype=torch.float32, device=self.device
+        )
+        values = torch.tensor(
+            [m[7] for m in self.rollout_storage], dtype=torch.float32, device=self.device
+        )
 
         # Optional curiosity augmentation
         if self.curiosity != 0 and self.icm is not None:
@@ -1560,57 +1693,105 @@ class PPOAgent:
                 rewards = intrinsic_reward.detach()
             _icm_loss = self.icm.update_ICM(forward_err, inverse_err)
 
-        logits, values = self.model(states)
-
-        masked_logits = logits.clone()
-        for i, inval in enumerate(invalid_actions):
-            if inval:
-                masked_logits[i, inval] = -1e9
-
-        dist = torch.distributions.Categorical(logits=masked_logits)
-        log_probs = dist.log_prob(actions)
-        entropy = dist.entropy().mean()
-
-        # Optional Munchausen shaping (note: PPO typically doesn't use this)
+        # Munchausen shaping is a value-based (DQN) trick: it rewrites the reward
+        # with a log-policy term that assumes a soft-greedy target. Under PPO it
+        # biases the advantage the surrogate is built on, so it is refused rather
+        # than silently applied.
         if self.munchausen:
-            rewards = rewards + self.alpha * torch.clamp(log_probs.detach(), min=self.lo, max=0.0)
+            raise ValueError(
+                "munchausen shaping is not compatible with the PPO surrogate; "
+                "set 'munchausen': 0 in the PPO hyper-parameter file"
+            )
 
-        # Monte-Carlo returns
-        returns: List[float] = []
-        running_return = 0.0
-        for reward, done in zip(reversed(rewards.detach().cpu().tolist()), reversed(dones)):
-            if done:
-                running_return = 0.0
-            running_return = reward + self.gamma * running_return
-            returns.insert(0, running_return)
+        # --- GAE(lambda) ---
+        last_value = self._bootstrap_value(next_states[-1], dones[-1])
+        advantages = torch.zeros_like(rewards)
+        gae = 0.0
+        for t in reversed(range(len(rewards))):
+            next_non_terminal = 0.0 if dones[t] else 1.0
+            next_value = last_value if t == len(rewards) - 1 else float(values[t + 1].item())
+            delta = (
+                float(rewards[t].item())
+                + self.gamma * next_value * next_non_terminal
+                - float(values[t].item())
+            )
+            gae = delta + self.gamma * self.gae_lambda * next_non_terminal * gae
+            advantages[t] = gae
 
-        returns_t = torch.tensor(returns, dtype=torch.float32, device=self.device).unsqueeze(1)
+        # The critic regresses on the same quantity the advantage was measured
+        # against, so returns are rebuilt from GAE rather than recomputed.
+        returns = advantages + values
 
-        advantages = returns_t - values.detach()
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Actor loss: policy gradient + entropy bonus
-        actor_loss = -(log_probs * advantages.squeeze(-1)).mean() - self.entropy_coeff * entropy
-
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        clip_grad_norm_(
-            list(self.model.actor_body.parameters()) + list(self.model.policy_head.parameters()),
-            self.grad_clip,
+        # Masks are rebuilt once as a dense tensor: the epoch loop indexes it per
+        # minibatch instead of walking the per-step Python lists n_epochs times.
+        mask = torch.zeros(
+            (len(invalid_actions), self.action_size), dtype=torch.bool, device=self.device
         )
-        self.actor_optimizer.step()
+        for i, inval in enumerate(invalid_actions):
+            if inval:
+                mask[i, inval] = True
 
-        # Critic loss: value regression
-        self.critic_optimizer.zero_grad()
-        _logits, values = self.model(states)
-        critic_loss = F.mse_loss(values.squeeze(-1), returns_t.squeeze(-1))
-        critic_loss.backward()
-        clip_grad_norm_(
-            list(self.model.critic_body.parameters()) + list(self.model.value_head.parameters()),
-            self.grad_clip,
-        )
-        self.critic_optimizer.step()
+        n = len(self.rollout_storage)
+        minibatch_size = min(self.minibatch_size, n)
+        actor_loss = torch.zeros((), device=self.device)
+        critic_loss = torch.zeros((), device=self.device)
+        stop_early = False
+
+        for _epoch in range(self.n_epochs):
+            perm = torch.randperm(n, device=self.device)
+            for start in range(0, n, minibatch_size):
+                idx = perm[start : start + minibatch_size]
+                # A trailing minibatch of one makes BatchNorm's batch statistics
+                # undefined and the advantage std meaningless; fold it away.
+                if idx.numel() < 2:
+                    continue
+
+                logits, value_pred = self.model(states[idx])
+                masked_logits = logits.masked_fill(mask[idx], -1e9)
+
+                dist = torch.distributions.Categorical(logits=masked_logits)
+                log_probs = dist.log_prob(actions[idx])
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(log_probs - old_log_probs[idx])
+                adv = advantages[idx]
+                unclipped = ratio * adv
+                clipped = torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * adv
+                actor_loss = -torch.min(unclipped, clipped).mean() - self.entropy_coeff * entropy
+
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                clip_grad_norm_(self.actor_parameters, self.grad_clip)
+                self.actor_optimizer.step()
+
+                # The critic shares no parameters with the actor here (separate
+                # bodies and heads), but the value head was consumed by the graph
+                # the actor step just freed, so it is re-evaluated.
+                _logits, value_pred = self.model(states[idx])
+                critic_loss = self.value_coeff * F.mse_loss(
+                    value_pred.reshape(-1), returns[idx]
+                )
+
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                clip_grad_norm_(self.critic_parameters, self.grad_clip)
+                self.critic_optimizer.step()
+
+            if self.target_kl is not None:
+                with torch.inference_mode(), inference_pass(self.model):
+                    logits, _value = self.model(states)
+                    full_dist = torch.distributions.Categorical(
+                        logits=logits.masked_fill(mask, -1e9)
+                    )
+                    approx_kl = (old_log_probs - full_dist.log_prob(actions)).mean().item()
+                if approx_kl > self.target_kl:
+                    stop_early = True
+
+            if stop_early:
+                break
 
         self.rollout_storage.clear()
 

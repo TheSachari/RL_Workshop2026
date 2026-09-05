@@ -136,7 +136,20 @@ def _agent_state(agent: Any, *, include_buffer: bool) -> dict:
         if hasattr(icm, "optimizer"):
             state["icm_optimizer"] = icm.optimizer.state_dict()
 
-    if include_buffer:
+    # PPO trains actor and critic through two separate optimisers instead of the
+    # single `optimizer` above. Without them a resume restores the weights but
+    # restarts Adam's moment estimates from zero, which shows up as a jolt in
+    # the loss right after every resume rather than as an error.
+    if hasattr(agent, "actor_optimizer"):
+        state["actor_optimizer"] = agent.actor_optimizer.state_dict()
+    if hasattr(agent, "critic_optimizer"):
+        state["critic_optimizer"] = agent.critic_optimizer.state_dict()
+
+    # PPO is on-policy: it holds a rollout it clears at every update, not a
+    # replay buffer. `include_buffer` therefore has nothing to save for it, and
+    # reaching for `agent.memory` raised `AttributeError` at the first
+    # checkpoint -- an hour into training, not at startup.
+    if include_buffer and getattr(agent, "memory", None) is not None:
         state["memory"] = _buffer_state(agent.memory)
 
     return state
@@ -238,7 +251,12 @@ def _restore_agent(agent: Any, state: dict) -> None:
         if "icm_optimizer" in state and hasattr(icm, "optimizer"):
             icm.optimizer.load_state_dict(state["icm_optimizer"])
 
-    if "memory" in state:
+    if "actor_optimizer" in state and hasattr(agent, "actor_optimizer"):
+        agent.actor_optimizer.load_state_dict(state["actor_optimizer"])
+    if "critic_optimizer" in state and hasattr(agent, "critic_optimizer"):
+        agent.critic_optimizer.load_state_dict(state["critic_optimizer"])
+
+    if "memory" in state and getattr(agent, "memory", None) is not None:
         _restore_buffer(agent.memory, state["memory"])
 
 
