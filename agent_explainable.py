@@ -147,6 +147,48 @@ def filter_q_values(q_values: Sequence[float], potential_actions: Sequence[int])
     return int(best_action)
 
 
+class RunningMeanStd:
+    """Welford accumulator for a scalar stream.
+
+    Used to normalise PPO's returns by their own scale. The reward weights stay
+    untouched: dividing by a running standard deviation rescales the critic's
+    target without changing which policy is optimal, since a positive affine
+    rescaling of the return leaves the argmax and the ordering of advantages
+    intact.
+
+    The count is kept as a float and never reset, so the estimate is stable
+    across a run whose reward scale drifts as the policy improves.
+    """
+
+    __slots__ = ("mean", "var", "count")
+
+    def __init__(self, epsilon: float = 1e-4) -> None:
+        self.mean = 0.0
+        self.var = 1.0
+        # Seeded rather than zero: the first update would otherwise divide by a
+        # variance estimated from a single batch.
+        self.count = epsilon
+
+    def update(self, x: Tensor) -> None:
+        batch_count = x.numel()
+        if batch_count == 0:
+            return
+        batch_mean = float(x.mean().item())
+        batch_var = float(x.var(unbiased=False).item())
+
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta * delta * self.count * batch_count / total) / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        return float(np.sqrt(self.var))
+
+
 def calculate_huber_loss(td_errors: Tensor, kappa: float = 1.0) -> Tensor:
     """Element-wise Huber loss.
 
@@ -1399,6 +1441,7 @@ class PPOAgent:
         gae_lambda: float = 0.95,
         value_coeff: float = 0.5,
         target_kl: Optional[float] = 0.03,
+        normalize_returns: bool = True,
     ) -> None:
         self.am = am
 
@@ -1408,6 +1451,15 @@ class PPOAgent:
         # the first `decay_update` steps run at a rate nothing had asked for.
         self.actor_lr = lr
         self.critic_lr = lr
+
+        # Return normalisation. The reward weights are left alone -- the scale is
+        # divided out here instead, where it actually hurts: the critic's target
+        # is a discounted sum of -100 penalties (roughly -600 at gamma 0.99) and
+        # it starts from zero, so the squared error and its gradient dwarf the
+        # policy term. FQF is spared this by its Huber loss, whose gradient is
+        # clipped past kappa; the PPO critic uses a plain MSE and is not.
+        self.normalize_returns = normalize_returns
+        self.return_rms = RunningMeanStd()
 
         # PPO surrogate objective.
         self.clip_range = clip_range
@@ -1702,6 +1754,28 @@ class PPOAgent:
                 "munchausen shaping is not compatible with the PPO surrogate; "
                 "set 'munchausen': 0 in the PPO hyper-parameter file"
             )
+
+        # --- Return normalisation ---
+        # The reward weights are left untouched; the scale is divided out here.
+        # The critic is trained on the normalised return below, so the values it
+        # predicts -- those stored by `act` and the bootstrap -- are already on
+        # the normalised scale. Only the raw rewards have to be divided, and the
+        # GAE recursion below then mixes quantities that share one scale.
+        #
+        # The estimate is updated from the *raw* discounted return, so the
+        # divisor tracks the true scale of the objective rather than the scale of
+        # the already-normalised signal, which would collapse towards 1.
+        if self.normalize_returns:
+            with torch.no_grad():
+                discounted = torch.zeros_like(rewards)
+                running = 0.0
+                for t in reversed(range(len(rewards))):
+                    if dones[t]:
+                        running = 0.0
+                    running = float(rewards[t].item()) + self.gamma * running
+                    discounted[t] = running
+            self.return_rms.update(discounted)
+            rewards = rewards / max(self.return_rms.std, 1e-6)
 
         # --- GAE(lambda) ---
         last_value = self._bootstrap_value(next_states[-1], dones[-1])

@@ -282,3 +282,54 @@ class TestSharedEncoder:
 
         after = dict(agent.model.named_parameters())[shared]
         assert not torch.allclose(before, after), "shared attention never updated"
+
+
+class TestReturnNormalisation:
+    """The critic regresses a discounted sum of -100 penalties -- roughly -600
+    at gamma 0.99 -- starting from zero. Under a plain MSE the squared error and
+    its gradient dwarf the policy term. FQF is spared this by its Huber loss,
+    whose gradient is clipped past kappa; the PPO critic is not, so the scale is
+    divided out here instead of in the reward weights.
+    """
+
+    def test_scale_estimate_tracks_the_raw_return(self, feasible):
+        agent = make_agent(batch_size=64, minibatch_size=16)
+        rng = np.random.default_rng(11)
+        for _ in range(64):
+            state, next_state = make_state(rng), make_state(rng)
+            action, _skill, _pot = agent.act(state, False)
+            agent.step(state, action, -100.0 if rng.random() < 0.06 else 0.0,
+                       next_state, False)
+        # Estimated from the raw return, so it stays on the reward's own scale
+        # rather than collapsing towards 1 as the normalised signal would.
+        assert agent.return_rms.std > 10.0
+
+    def test_normalisation_shrinks_the_critic_target(self, feasible):
+        losses = {}
+        for flag in (False, True):
+            agent = make_agent(batch_size=64, minibatch_size=16,
+                               normalize_returns=flag)
+            rng = np.random.default_rng(12)
+            seen = []
+            for _ in range(128):
+                state, next_state = make_state(rng), make_state(rng)
+                action, _skill, _pot = agent.act(state, False)
+                out = agent.step(state, action,
+                                 -100.0 if rng.random() < 0.06 else 0.0,
+                                 next_state, False)
+                if out is not None:
+                    seen.append(float(out[1]))
+            losses[flag] = seen
+
+        assert losses[True] and losses[False]
+        assert max(losses[True]) < max(losses[False]) / 100
+
+    def test_disabled_leaves_rewards_untouched(self, feasible):
+        agent = make_agent(batch_size=64, minibatch_size=16,
+                           normalize_returns=False)
+        rng = np.random.default_rng(13)
+        for _ in range(64):
+            state, next_state = make_state(rng), make_state(rng)
+            action, _skill, _pot = agent.act(state, False)
+            agent.step(state, action, -100.0, next_state, False)
+        assert agent.return_rms.count == pytest.approx(1e-4)
