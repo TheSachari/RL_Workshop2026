@@ -9,9 +9,11 @@ le même chemin de code que les évaluations publiées.
 Usage :
   python tools/waste_agent.py -- <arguments habituels de agent_run_explainable.py>
 """
+import json
 import os
 import runpy
 import sys
+from collections import Counter
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -28,6 +30,10 @@ live = {"num_role": None}
 _veh = {"key": None, "base": 0}
 tally = {"total": 0, "exigees": 0, "gaspillees": 0,
          "decisions_avec_irrev": 0, "role_introuvable": 0}
+
+# Ventilation par identifiant de compétence, en plus des totaux. `held` porte
+# déjà les identifiants : les compter par clé ne change rien au comptage global.
+per_skill = {"exigees": Counter(), "gaspillees": Counter()}
 
 
 def gen_state_tracked(st, *a, **kw):
@@ -70,6 +76,11 @@ def spent_by_tracked(st, ff_array, ff_existing, action, n_following=5, cache=Non
     tally["total"] += int(held.size)
     tally["exigees"] += exigees
     tally["gaspillees"] += int(held.size) - exigees
+
+    req_set = set() if required is None else set(required.tolist())
+    for skill in held.tolist():
+        key = "exigees" if skill in req_set else "gaspillees"
+        per_skill[key][int(skill)] += 1
     return total
 
 
@@ -93,4 +104,15 @@ finally:
           f"  ({100*t['exigees']/max(t['total'],1):5.1f} %)")
     print(f"  NON exigées -> gaspillage    : {t['gaspillees']:6d}"
           f"  ({100*t['gaspillees']/max(t['total'],1):5.1f} %)")
+
+    # Ventilation par compétence, à côté du .pkl de métriques. Le tag de sortie
+    # est celui de `--save_metrics_as`, pour que les deux fichiers s'apparient.
+    tag = "run"
+    if "--save_metrics_as" in sys.argv:
+        tag = sys.argv[sys.argv.index("--save_metrics_as") + 1]
+    out = os.path.join(REPO, "run_full", "Plots", f"per_skill_{tag}.json")
+    with open(out, "w") as f:
+        json.dump({k: {str(i): n for i, n in c.most_common()}
+                   for k, c in per_skill.items()}, f, indent=1)
+    print(f"ventilation par compétence     : {out}")
     print(f"rôle non résolu (contrôle)     : {t['role_introuvable']}")

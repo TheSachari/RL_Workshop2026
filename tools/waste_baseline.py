@@ -11,9 +11,11 @@ minimum de niveau de compétence et ne lit jamais le générateur, donc son
 resultat est identique quelle que soit la graine.
 """
 import argparse
+import json
 import os
 import random
 import sys
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,12 +25,18 @@ import simulator as sim
 from collective_functions import (load_environment, apply_logic,
                                   get_potential_actions)
 from explainability import rare_skills_for_step
+from paths import PLOTS, resolve
 from sim_state import Fleet
 
 live = {}
 cache = {}
 tally = {"total": 0, "exigees": 0, "gaspillees": 0,
          "decisions_avec_irrev": 0, "decisions": 0, "role_introuvable": 0}
+
+# Ventilation par identifiant de compétence, en plus des totaux. `held` porte
+# déjà les identifiants : les compter par clé ne change rien au comptage global,
+# qui reste la somme de ces compteurs.
+per_skill = {"exigees": Counter(), "gaspillees": Counter()}
 
 _orig_gen_state = sim.gen_state
 _veh = {"key": None, "base": 0}
@@ -94,6 +102,11 @@ def irreversible_split(st, ff_array, ff_existing, action):
     tally["total"] += total
     tally["exigees"] += exigees
     tally["gaspillees"] += total - exigees
+
+    req_set = set() if required is None else set(required.tolist())
+    for skill in held.tolist():
+        key = "exigees" if skill in req_set else "gaspillees"
+        per_skill[key][int(skill)] += 1
     return total
 
 
@@ -136,7 +149,8 @@ def main():
           f" | seed={args.seed} ===")
     # Tous les indicateurs d'observation, pour que le tableau récapitulatif
     # sorte d'un seul passage plutôt que d'un run par ligne.
-    for k in ("v_required", "v_sent", "v_sent_full", "v_degraded",
+    for k in ("v_required", "v_sent", "v_sent_initial",
+              "v_sent_full", "v_degraded",
               "function_not_found", "v1_not_sent_from_s1",
               "v3_not_sent_from_s3", "v_not_found_in_last_station",
               "skill_lvl", "ff_sent", "rupture_ff"):
@@ -151,6 +165,17 @@ def main():
           f"  ({100*t['gaspillees']/max(t['total'],1):5.1f} %)")
     print(f"\nrôle non résolu (contrôle)       : {t['role_introuvable']}")
     print(f"contrôle dic_indic               : {env.dic_indic['irreversible_spent']}")
+
+    # Ventilation par compétence : un JSON à côté du .pkl de métriques, trop
+    # volumineux pour le log et de toute façon plus commode à relire ainsi.
+    out = resolve(f"per_skill_{args.tag}.json", PLOTS)
+    with open(out, "w") as f:
+        json.dump({k: {str(i): n for i, n in c.most_common()}
+                   for k, c in per_skill.items()}, f, indent=1)
+    print(f"ventilation par compétence       : {out}")
+    top = per_skill["gaspillees"].most_common(5)
+    print("  5 compétences les plus gaspillées : "
+          + ", ".join(f"{i}({n})" for i, n in top))
 
 
 if __name__ == "__main__":

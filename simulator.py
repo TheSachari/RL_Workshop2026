@@ -224,6 +224,11 @@ class _LoopState:
     # The crew `decide` is currently choosing from; an action index is a
     # position in this list. Set by `_fill_roles`, read by explainability.
     ff_existing: list = field(default_factory=list)
+    # Besoins (`num_d`) déjà servis par un départ dans l'intervention courante.
+    # Un besoin non satisfait en effectif complet est reporté sur la caserne
+    # suivante, qui envoie un second véhicule pour la même demande : sans cette
+    # mémoire, ces reprises seraient comptées comme autant de demandes.
+    served_num_d: set = field(default_factory=set)
 
 
 def _unpack_row(st: _LoopState, row) -> None:
@@ -326,6 +331,12 @@ def _depart_on_intervention(st: _LoopState, ff_to_send: list) -> None:
     st.vehicle_out += 1
 
     st.dic_indic["v_sent"] += 1
+    # `v_sent_initial` compte une fois par demande servie : ni les renforts Z1
+    # (num_d >= 99), ni les reprises d'un départ dégradé, qui renvoient un
+    # véhicule pour un `num_d` déjà servi plus tôt dans la même intervention.
+    if st.num_d < _REINFORCEMENT_NUM_D and st.num_d not in st.served_num_d:
+        st.served_num_d.add(st.num_d)
+        st.dic_indic["v_sent_initial"] += 1
     if st.degraded:
         st.dic_indic["v_degraded"] += 1
     else:
@@ -598,7 +609,11 @@ def _fill_station(st: _LoopState) -> None:
 
 def _handle_intervention(st: _LoopState) -> None:
     """Dispatch one intervention, walking outward through the nearest stations."""
+    st.served_num_d = set()
     st.veh_depart = [v[0] for k, v in sorted(st.required_departure.items())]
+    # `v_required` ne voit que le train de l'intervention : `_handle_intervention`
+    # n'est appelé que pour lui, jamais pour un renfort Z1 (num_d >= 99). Il est
+    # donc déjà « hors renfort », et c'est `v_sent` qui, lui, les inclut.
     st.dic_indic["v_required"] += len(st.required_departure)
     _split_train(st)
 

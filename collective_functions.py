@@ -587,6 +587,8 @@ def load_environment_variables(constraint_factor_veh, constraint_factor_ff, data
     
     dic_ff = {ff:0 for ff in df_skills.index}
     dic_indic = {'v_required': 0,
+                    # Départs du train de l'intervention, renforts Z1 exclus.
+                    'v_sent_initial': 0,
                     'v_sent': 0,
                     'v_sent_full':0,
                     'v_degraded':0,

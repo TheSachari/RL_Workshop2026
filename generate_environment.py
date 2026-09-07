@@ -43,18 +43,28 @@ Inputs expected on disk
 
 Outputs
 -------
-- ./Data_environment/df_stations.pkl
-- ./Data_environment/df_v.pkl
-- ./Data_environment/df_skills.pkl
-- ./Data_environment/df_roles.pkl
-- ./Data_environment/df_vehicles_history.pkl
-- ./Data_environment/df_pc_real.pkl
-- ./Data_environment/<save_as>  (combined fake event stream)
-- ./Data_environment/planning.pkl
+Grouped by `--only` target; without the flag every group is written, which is
+the historical behaviour.
+
+- tables   : df_stations.pkl, df_v.pkl, df_skills.pkl, df_roles.pkl,
+             df_vehicles_history.pkl
+- real     : df_pc_real.pkl (or df_pc_real_prob.pkl under --prob_dep)
+- fake     : <save_as>, the combined synthetic event stream
+- planning : planning.pkl
 
 Notes
 -----
 - Paths come from `paths.py`, so the script can be run from any directory.
+- Every group except `fake` is an input to the golden cases, so regenerating a
+  synthetic stream used to overwrite the references it is compared against.
+  `--only fake` adds one and leaves the rest alone:
+
+      python generate_environment.py --prob_dep --only fake \
+          --sample_list df_fake_test_p12_02.pkl \
+          --save_as df_pc_fake_test_p12_02.pkl
+
+  `--prob_dep` still derives its departure distribution from the real stream,
+  so that stream is recomputed in memory; it simply is not written back.
 """
 
 import argparse
@@ -63,6 +73,7 @@ import pickle
 import random
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 import geopandas as gpd
@@ -79,6 +90,10 @@ from paths import (
     DATA_TRAINED,
     resolve,
 )
+
+# Même valeur que `collective_functions.DEFAULT_SEED`, redéfinie ici pour ne pas
+# importer la simulation dans un script de préparation de données.
+DEFAULT_SEED = 42
 
 
 def reorg_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -404,7 +419,8 @@ def precompute_prob_dict(df_inter_clean: pd.DataFrame) -> dict:
     return {k: {kk: dict(vv) for kk, vv in v.items()} for k, v in prob_dict.items()}
 
 
-def prob_departure(area_type: str, inc_name: str, prob_dict: dict) -> dict:
+def prob_departure(area_type: str, inc_name: str, prob_dict: dict,
+                   rng: random.Random | None = None) -> dict:
     """
     Sample a departure dictionary from probabilities.
 
@@ -415,14 +431,15 @@ def prob_departure(area_type: str, inc_name: str, prob_dict: dict) -> dict:
     dict
         Departure mapping like {1: [veh1], 2: [veh2], ...} or {0: "RETURN"} (elsewhere).
     """
+    draw = rng if rng is not None else random
     if area_type in prob_dict[inc_name]:
         choices = list(prob_dict[inc_name][area_type].keys())
         weights = list(prob_dict[inc_name][area_type].values())
-        dep_tuple = random.choices(choices, weights=weights, k=1)[0]
+        dep_tuple = draw.choices(choices, weights=weights, k=1)[0]
     elif "*" in prob_dict[inc_name]:
         choices = list(prob_dict[inc_name]["*"].keys())
         weights = list(prob_dict[inc_name]["*"].values())
-        dep_tuple = random.choices(choices, weights=weights, k=1)[0]
+        dep_tuple = draw.choices(choices, weights=weights, k=1)[0]
     else:
         # Unspecified behavior in original code: keep it explicit
         dep_tuple = tuple()
@@ -430,12 +447,25 @@ def prob_departure(area_type: str, inc_name: str, prob_dict: dict) -> dict:
     return {i + 1: [val] for i, val in enumerate(dep_tuple)}
 
 
-def precompute_prob_departure(df_sample: pd.DataFrame, prob_dict: dict) -> pd.DataFrame:
+def precompute_prob_departure(df_sample: pd.DataFrame, prob_dict: dict,
+                              seed: int = DEFAULT_SEED) -> pd.DataFrame:
     """
     Add a 'departure' column by sampling from the probability dictionary.
+
+    The draw is seeded per call, on a generator of its own rather than the
+    global `random`. Sharing the global one made the result depend on how much
+    sampling had happened earlier in the process: building the real stream
+    before a synthetic one shifted the latter's draws by 53 088 positions, and
+    changed 17 255 of its 127 392 departures. Each stream now draws the same
+    way whatever ran before it.
+
+    Passing an explicit `seed` gives independent draws for successive years --
+    that is how `build_fake` keeps a decade from being ten copies of one year.
     """
+    rng = random.Random(seed)
     df_sample["departure"] = df_sample.apply(
-        lambda row: prob_departure(row["area_type"], row["incident_name"], prob_dict),
+        lambda row: prob_departure(row["area_type"], row["incident_name"],
+                                   prob_dict, rng),
         axis=1,
     )
     return df_sample
@@ -696,12 +726,194 @@ def create_dic_planning(chemin_dossier: str) -> dict:
     return planning
 
 
-def main() -> None:
-    """
-    Script entry point.
+# Zones de rattachement, du plus dense au plus rural. Elles pilotent la
+# reconstruction du départ et ne dépendent d'aucune donnée d'entrée.
+Z_1 = ["TOULOUSE - LOUGNON", "TOULOUSE - VION"]
+Z_2 = ["ST JORY", "ROUFFIAC", "RAMONVILLE - BUCHENS", "COLOMIERS", "MURET - MASSAT"]
+Z_3 = ["AUTERIVE", "ST LYS", "GRENADE", "FRONTON", "VERFEIL", "CARAMAN"]
 
-    This preserves the original execution behavior while keeping imports side-effect free.
+# Colonnes ramenées dans [0, 1] avant écriture d'un flux.
+COLS_TO_NORM = ["Coord X", "Coord Y", "Month_sin", "Month_cos",
+                "Day_sin", "Day_cos", "Hour_sin", "Hour_cos"]
+
+ALL_TARGETS = ("tables", "real", "fake", "planning")
+
+
+@dataclass
+class Sources:
+    """Tables brutes et référentiels, partagés par les deux flux."""
+
+    df_pdd: gpd.GeoDataFrame
+    df_stations: pd.DataFrame
+    stations_u: list[str]
+    df_v: pd.DataFrame
+    df_skills: pd.DataFrame
+    df_roles: pd.DataFrame
+    df_vehicles_history: pd.DataFrame
+    df_xy: pd.DataFrame
+    df_lieu: pd.DataFrame
+    df_commune: pd.DataFrame
+    df_nom_commune: pd.DataFrame
+    df_secteur: pd.DataFrame
+    df_prob_dep: pd.DataFrame
+    df_rank_incident: pd.DataFrame
+    dic_inc_ar_mat: dict
+
+
+def load_sources() -> Sources:
+    """Lit les CSV/GeoJSON d'entrée et construit les tables dérivées."""
+    df_firestations = pd.read_csv(DATA / "firestations.csv", sep=";")
+    df_materiel = pd.read_csv(DATA / "materiel.csv", sep=";")
+    df_comp = pd.read_csv(DATA / "comp.csv", sep=";")
+    df_roles = pd.read_csv(DATA / "roles_competences.csv", sep=";")
+    df_vehicles_history = pd.read_csv(DATA / "df_vehicles_history.csv", sep=";")
+    df_responses = pd.read_csv(DATA / "responses_by_incident.csv", sep=";")
+
+    df_stations = generate_stations(df_firestations)
+    stations_u = sorted(
+        x for x in df_materiel["Nom du Centre"].unique()
+        if not x.startswith("X") and not x.startswith("Z")
+    )
+    df_skills, _df_firefighters = generate_firefighters(df_comp)
+    df_rank_incident = pd.read_pickle(DATA_PREPROCESSED / "df_rank_incident.pkl")
+
+    return Sources(
+        df_pdd=gpd.read_file(DATA / "pdd.geojson"),
+        df_stations=df_stations,
+        stations_u=stations_u,
+        df_v=generate_vehicles(df_materiel, df_stations),
+        df_skills=df_skills,
+        df_roles=df_roles,
+        df_vehicles_history=df_vehicles_history,
+        df_xy=pd.read_csv(DATA / "X-Y-lieu.csv", sep=";"),
+        df_lieu=pd.read_csv(DATA / "dbo.LIEU.csv", sep=";"),
+        df_commune=pd.read_csv(DATA / "dbo.COMMUNE.csv", sep=";"),
+        df_nom_commune=pd.read_csv(DATA / "dbo.NOM_COMMUNE.csv", sep=";"),
+        df_secteur=pd.read_csv(DATA / "dbo.SECTEUR.csv", sep=";"),
+        df_prob_dep=pd.read_pickle(DATA_PREPROCESSED / "df_prob_dep.pkl"),
+        df_rank_incident=df_rank_incident,
+        dic_inc_ar_mat=create_responses(df_responses, df_rank_incident),
+    )
+
+
+def write_tables(src: Sources) -> None:
+    """Écrit les référentiels que lisent la simulation et les cas golden."""
+    src.df_stations.to_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
+    src.df_v.to_pickle(DATA_ENVIRONMENT / "df_v.pkl")
+    src.df_skills.to_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
+    src.df_roles.to_pickle(DATA_ENVIRONMENT / "df_roles.pkl")
+    src.df_vehicles_history.to_pickle(DATA_ENVIRONMENT / "df_vehicles_history.pkl")
+
+
+def locate(df: pd.DataFrame, src: Sources) -> pd.DataFrame:
+    """Situe chaque intervention : casernes, zone, type d'incident, secteur.
+
+    Identique pour le flux réel et le flux synthétique -- c'est la seule
+    géographie que le reste du script suppose déjà calculée.
     """
+    df = precompute_pdd(src.df_pdd, df, src.stations_u)
+    df = precompute_zone(src.df_stations, df, Z_1, Z_2, Z_3)
+    df = precompute_incident(src.df_rank_incident, df)
+    return precompute_area_type(src.df_xy, src.df_lieu, src.df_nom_commune,
+                                src.df_commune, src.df_secteur, df)
+
+
+def normalise(df: pd.DataFrame) -> pd.DataFrame:
+    """Ramène les colonnes continues dans [0, 1]. Une colonne constante vaut 0."""
+    for col in COLS_TO_NORM:
+        lo, hi = df[col].min(), df[col].max()
+        df[col] = (df[col] - lo) / (hi - lo) if lo != hi else 0.0
+    return df
+
+
+def build_real(src: Sources, prob_dep: bool, start_year: int,
+               write: bool = True,
+               seed: int = DEFAULT_SEED) -> tuple[pd.DataFrame | None, str, dict | None]:
+    """Construit le flux réel, et la table de probabilités qu'il porte.
+
+    Renvoie aussi `prob_dict` parce que le flux synthétique probabiliste en
+    dépend : les départs y sont tirés de la distribution observée sur le réel.
+
+    `write=False` s'arrête dès que `prob_dict` est disponible. Ce n'est pas
+    qu'une économie : `prob_departure` tire dans le `random` global, non semé,
+    donc chaque tirage supplémentaire décale ceux du flux synthétique. Aller
+    jusqu'au bout du flux réel alors qu'on ne le garde pas changerait les
+    départs tirés ensuite -- 17 255 lignes sur 127 392 lors du refactor.
+    """
+    df = pd.read_pickle(DATA_TRAINED / "df_real.pkl")
+    window = len(df)
+    print("window real:", window)
+
+    df = locate(df, src)
+
+    prob_dict = None
+    if prob_dep:
+        df = pd.concat([df, src.df_prob_dep], axis=1)
+        prob_dict = precompute_prob_dict(df)
+        print("prob_dict computed")
+        if not write:
+            return None, "_prob", prob_dict
+        df = precompute_prob_departure(df, prob_dict, seed)
+        suffix = "_prob"
+    else:
+        if not write:
+            return None, "", None
+        df = precompute_departure(df, src.dic_inc_ar_mat)
+        suffix = ""
+
+    print("start_year", start_year, "start_inter", 1, "end_inter", window)
+    df = precompute_date(df, start_year)
+    df = precompute_returns(df, 1, window, False)
+    print("real", len(df), "done")
+
+    return normalise(df), suffix, prob_dict
+
+
+def build_fake(src: Sources, sample_list: list[str], prob_dep: bool,
+               start_year: int, prob_dict: dict | None,
+               seed: int = DEFAULT_SEED) -> pd.DataFrame:
+    """Enchaîne les années échantillonnées en une seule frise continue.
+
+    `num_inter` se poursuit d'une année sur l'autre, de sorte que dix années
+    forment une timeline et non dix qui se recouvrent.
+    """
+    frames = []
+    start_inter, end_inter, window = 1, 0, 0
+
+    for sample_file in sample_list:
+        start_inter += window
+        df = pd.read_pickle(resolve(sample_file, DATA_SAMPLED))
+        # Le 29 février doit être ajouté avant le comptage : `window` fixe la
+        # plage de num_inter attribuée par precompute_returns, et des lignes
+        # ajoutées après laisseraient la numérotation trop courte.
+        df = add_leap_day(df, start_year)
+
+        window = len(df)
+        end_inter += window
+        print("window fake:", window)
+        print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
+
+        df = locate(df, src)
+        if prob_dep:
+            # Décalée par l'année : sans cela, dix années tireraient les mêmes
+            # départs et la décennie ne serait qu'une seule année répétée.
+            df = precompute_prob_departure(df, prob_dict, seed + start_year)
+        else:
+            df = precompute_departure(df, src.dic_inc_ar_mat)
+
+        df = precompute_date(df, start_year)
+        df = precompute_returns(df, start_inter, end_inter, True)
+
+        print(sample_file, len(df), "done")
+        frames.append(df)
+        start_year += 1
+
+    if not frames:
+        return pd.DataFrame()
+    return normalise(reorg_dates(pd.concat(frames, ignore_index=True)))
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Environment params")
     parser.add_argument("--prob_dep", action="store_true", help="if departure is computed from probabilities")
     parser.add_argument("--sample_list", nargs="+", help="List of samples to use")
@@ -713,144 +925,103 @@ def main() -> None:
         help="calendar year the first generated year is stamped with; each "
              "further sample takes the next year (default: the current year)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"seed for the probabilistic departure draw (default: {DEFAULT_SEED}). "
+             "Each synthetic year offsets it by its own calendar year, so a "
+             "decade stays ten distinct draws.",
+    )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        choices=ALL_TARGETS,
+        help="artefacts to (re)generate; default: all of them. Generating only "
+             "the fake stream leaves the golden inputs -- df_pc_real*.pkl, "
+             "planning.pkl, df_skills.pkl, df_stations.pkl, df_v.pkl, "
+             "df_roles.pkl, df_vehicles_history.pkl -- untouched.",
+    )
+    args = parser.parse_args(argv)
+
+    # Sans `--only`, tout est régénéré : le comportement historique, où une
+    # invocation sans `--sample_list` produisait simplement les tables, le flux
+    # réel et le planning. Ne valider que si `fake` a été demandé
+    # explicitement, sinon cet appel-là cesserait de fonctionner.
+    args.targets = set(args.only) if args.only else set(ALL_TARGETS)
+    if args.only and "fake" in args.targets:
+        if not args.sample_list:
+            parser.error("--only fake demande --sample_list")
+        if not args.save_as:
+            parser.error("--only fake demande --save_as")
+    return args
+
+
+def real_stream_plan(targets: set[str], prob_dep: bool) -> tuple[bool, bool]:
+    """(construire, écrire) le flux réel.
+
+    Le flux synthétique probabiliste tire ses départs de `prob_dict`, qui se
+    déduit du réel : `--only fake --prob_dep` doit donc le construire. Mais
+    c'est l'écriture, et elle seule, qui écrase les entrées des cas golden --
+    d'où les deux booléens plutôt qu'un.
+    """
+    write = "real" in targets
+    build = write or (prob_dep and "fake" in targets)
+    return build, write
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Point d'entrée : construit les artefacts demandés par `--only`."""
+    args = parse_args(argv)
+    targets = args.targets
 
     print("is probabilistic departure", args.prob_dep)
+    print("targets:", " ".join(sorted(targets)))
 
-    Z_1 = ["TOULOUSE - LOUGNON", "TOULOUSE - VION"]
-    Z_2 = ["ST JORY", "ROUFFIAC", "RAMONVILLE - BUCHENS", "COLOMIERS", "MURET - MASSAT"]
-    Z_3 = ["AUTERIVE", "ST LYS", "GRENADE", "FRONTON", "VERFEIL", "CARAMAN"]
-
-    df_firestations = pd.read_csv(DATA / "firestations.csv", sep=";")
-    df_materiel = pd.read_csv(DATA / "materiel.csv", sep=";")
-    df_comp = pd.read_csv(DATA / "comp.csv", sep=";")
-    df_roles = pd.read_csv(DATA / "roles_competences.csv", sep=";")
-    df_vehicles_history = pd.read_csv(DATA / "df_vehicles_history.csv", sep=";")
-
-    df_xy = pd.read_csv(DATA / "X-Y-lieu.csv", sep=";")
-    df_lieu = pd.read_csv(DATA / "dbo.LIEU.csv", sep=";")
-    df_secteur = pd.read_csv(DATA / "dbo.SECTEUR.csv", sep=";")
-    df_commune = pd.read_csv(DATA / "dbo.COMMUNE.csv", sep=";")
-    df_nom_commune = pd.read_csv(DATA / "dbo.NOM_COMMUNE.csv", sep=";")
-    df_responses = pd.read_csv(DATA / "responses_by_incident.csv", sep=";")
-    df_pdd = gpd.read_file(DATA / "pdd.geojson")
-
-    df_stations = generate_stations(df_firestations)
-    stations_u = sorted(x for x in df_materiel["Nom du Centre"].unique() if not x.startswith("X") and not x.startswith("Z"))
-    df_v = generate_vehicles(df_materiel, df_stations)
-    df_skills, df_firefighters = generate_firefighters(df_comp)
+    src = load_sources()
 
     DATA_ENVIRONMENT.mkdir(parents=True, exist_ok=True)
-    df_stations.to_pickle(DATA_ENVIRONMENT / "df_stations.pkl")
-    df_v.to_pickle(DATA_ENVIRONMENT / "df_v.pkl")
-    df_skills.to_pickle(DATA_ENVIRONMENT / "df_skills.pkl")
-    df_roles.to_pickle(DATA_ENVIRONMENT / "df_roles.pkl")
-    df_vehicles_history.to_pickle(DATA_ENVIRONMENT / "df_vehicles_history.pkl")
-
-    df_prob_dep = pd.read_pickle(DATA_PREPROCESSED / "df_prob_dep.pkl")
-    df_rank_incident = pd.read_pickle(DATA_PREPROCESSED / "df_rank_incident.pkl")
-
-    dic_inc_ar_mat = create_responses(df_responses, df_rank_incident)
-
-    # REAL
-    is_fake = False
-    df_pc_real = pd.read_pickle(DATA_TRAINED / "df_real.pkl")
-    window = len(df_pc_real)
-    print("window real:", window)
-
-    df_pc_real = precompute_pdd(df_pdd, df_pc_real, stations_u)
-    df_pc_real = precompute_zone(df_stations, df_pc_real, Z_1, Z_2, Z_3)
-    df_pc_real = precompute_incident(df_rank_incident, df_pc_real)
-    df_pc_real = precompute_area_type(df_xy, df_lieu, df_nom_commune, df_commune, df_secteur, df_pc_real)
-
-    if args.prob_dep:
-        df_pc_real = pd.concat([df_pc_real, df_prob_dep], axis=1)
-        prob_dict = precompute_prob_dict(df_pc_real)
-        print("prob_dict computed")
-        df_pc_real = precompute_prob_departure(df_pc_real, prob_dict)
-        suffix = "_prob"
+    if "tables" in targets:
+        write_tables(src)
+        print("tables done")
     else:
-        df_pc_real = precompute_departure(df_pc_real, dic_inc_ar_mat)
-        suffix = ""
+        print("tables skipped")
 
-    start_year = args.start_year
-    start_inter = 1
-    end_inter = window
-    print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
-
-    df_pc_real = precompute_date(df_pc_real, start_year)
-    df_pc_real = precompute_returns(df_pc_real, start_inter, end_inter, is_fake)
-    print("real", len(df_pc_real), "done")
-
-    cols_to_norm = ["Coord X", "Coord Y", "Month_sin", "Month_cos", "Day_sin", "Day_cos", "Hour_sin", "Hour_cos"]
-    for col in cols_to_norm:
-        min_val = df_pc_real[col].min()
-        max_val = df_pc_real[col].max()
-        df_pc_real[col] = (df_pc_real[col] - min_val) / (max_val - min_val) if min_val != max_val else 0.0
-
-    df_pc_real.to_pickle(DATA_ENVIRONMENT / ("df_pc_real" + suffix + ".pkl"))
-
-    # FAKE
-    is_fake = True
-    dfs_to_concat = []
-    start_year = args.start_year
-    start_inter = 1
-    window = 0
-    end_inter = 0
-
-    for sample_file in args.sample_list or []:
-        start_inter += window
-        sample_path = resolve(sample_file, DATA_SAMPLED)
-
-        df_pc_fake = pd.read_pickle(sample_path)
-        # A leap year needs its 366th day before the interventions are counted:
-        # `window` sizes the num_inter range assigned in precompute_returns, so
-        # adding rows after this point would leave the numbering short.
-        df_pc_fake = add_leap_day(df_pc_fake, start_year)
-
-        window = len(df_pc_fake)
-        print("window fake:", window)
-        end_inter += window
-
-        print("start_year", start_year, "start_inter", start_inter, "end_inter", end_inter)
-
-        df_pc_fake = precompute_pdd(df_pdd, df_pc_fake, stations_u)
-        df_pc_fake = precompute_zone(df_stations, df_pc_fake, Z_1, Z_2, Z_3)
-        df_pc_fake = precompute_incident(df_rank_incident, df_pc_fake)
-        df_pc_fake = precompute_area_type(df_xy, df_lieu, df_nom_commune, df_commune, df_secteur, df_pc_fake)
-
-        if args.prob_dep:
-            df_pc_fake = precompute_prob_departure(df_pc_fake, prob_dict)
+    # Le flux synthétique probabiliste tire ses départs de `prob_dict`, qui se
+    # déduit du flux réel. `--only fake --prob_dep` doit donc quand même
+    # construire le réel, mais sans l'écrire : c'est l'écriture, et elle seule,
+    # qui écrase les entrées des cas golden.
+    prob_dict = None
+    build, write = real_stream_plan(targets, args.prob_dep)
+    if build:
+        df_real, suffix, prob_dict = build_real(src, args.prob_dep,
+                                                args.start_year, write=write,
+                                                seed=args.seed)
+        if write:
+            df_real.to_pickle(DATA_ENVIRONMENT / f"df_pc_real{suffix}.pkl")
         else:
-            df_pc_fake = precompute_departure(df_pc_fake, dic_inc_ar_mat)
-
-        df_pc_fake = precompute_date(df_pc_fake, start_year)
-        df_pc_fake = precompute_returns(df_pc_fake, start_inter, end_inter, is_fake)
-
-        print(sample_file, len(df_pc_fake), "done")
-        dfs_to_concat.append(df_pc_fake)
-        start_year += 1
-
-    df_pc_fake = pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else pd.DataFrame()
-    if len(df_pc_fake):
-        df_pc_fake = reorg_dates(df_pc_fake)
-
-        for col in cols_to_norm:
-            min_val = df_pc_fake[col].min()
-            max_val = df_pc_fake[col].max()
-            df_pc_fake[col] = (df_pc_fake[col] - min_val) / (max_val - min_val) if min_val != max_val else 0.0
-
-        df_pc_fake.to_pickle(resolve(args.save_as, DATA_ENVIRONMENT))
-        print("global fake done", len(df_pc_fake))
+            print("real stream stopped at prob_dict, not written")
     else:
-        print("No fake samples provided; skipping fake stream generation.")
+        print("real skipped")
 
-    # Planning
-    planning = create_dic_planning(str(DATA / "Planning") + "/")
+    if "fake" in targets:
+        df_fake = build_fake(src, args.sample_list or [], args.prob_dep,
+                             args.start_year, prob_dict, seed=args.seed)
+        if len(df_fake):
+            df_fake.to_pickle(resolve(args.save_as, DATA_ENVIRONMENT))
+            print("global fake done", len(df_fake))
+        else:
+            print("No fake samples provided; skipping fake stream generation.")
+    else:
+        print("fake skipped")
 
-    with open(DATA_ENVIRONMENT / "planning.pkl", "wb") as f:
-        pickle.dump(planning, f)
-    print("Planning done")
+    if "planning" in targets:
+        planning = create_dic_planning(str(DATA / "Planning") + "/")
+        with open(DATA_ENVIRONMENT / "planning.pkl", "wb") as f:
+            pickle.dump(planning, f)
+        print("Planning done")
+    else:
+        print("planning skipped")
 
 
 if __name__ == "__main__":
